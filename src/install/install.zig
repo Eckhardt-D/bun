@@ -13824,6 +13824,10 @@ pub const PackageManager = struct {
             for (resolution_list.get(resolutions_buffer), dependency_list.get(dependencies_buffer)) |package_id, failed_dep| {
                 if (package_id < end) continue;
 
+                // Skip resolutions, they are most likely from deeply nested
+                // dependencies with arbitrary names.
+                if (failed_dep.version.tag == .git) continue;
+
                 // TODO lockfile rewrite: remove this and make non-optional peer dependencies error if they did not resolve.
                 //      Need to keep this for now because old lockfiles might have a peer dependency without the optional flag set.
                 if (failed_dep.behavior.isPeer()) continue;
