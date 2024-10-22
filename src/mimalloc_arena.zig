@@ -8,6 +8,7 @@ const FeatureFlags = @import("./feature_flags.zig");
 const Allocator = mem.Allocator;
 const assert = bun.assert;
 const bun = @import("root").bun;
+const log = bun.Output.scoped(.mimalloc, true);
 
 pub const GlobalArena = struct {
     arena: Arena,
@@ -149,9 +150,9 @@ pub const Arena = struct {
     }
 
     pub fn deinit(this: *Arena) void {
-        if (comptime Environment.isDebug) {
-            ArenaRegistry.unregister(this.*);
-        }
+        // if (comptime Environment.isDebug) {
+        //     ArenaRegistry.unregister(this.*);
+        // }
         mimalloc.mi_heap_destroy(this.heap.?);
 
         this.heap = null;
@@ -186,14 +187,21 @@ pub const Arena = struct {
 
     pub fn init() !Arena {
         const arena = Arena{ .heap = mimalloc.mi_heap_new() orelse return error.OutOfMemory };
-        if (comptime Environment.isDebug) {
-            ArenaRegistry.register(arena);
-        }
+        // if (comptime Environment.isDebug) {
+        //     ArenaRegistry.register(arena);
+        // }
         return arena;
     }
 
     pub fn gc(this: Arena, force: bool) void {
         mimalloc.mi_heap_collect(this.heap orelse return, force);
+    }
+
+    pub inline fn helpCatchMemoryIssues(this: Arena) void {
+        if (comptime FeatureFlags.help_catch_memory_issues) {
+            this.gc(true);
+            bun.Mimalloc.mi_collect(true);
+        }
     }
 
     pub fn ownsPtr(this: Arena, ptr: *const anyopaque) bool {
@@ -202,7 +210,7 @@ pub const Arena = struct {
     pub const supports_posix_memalign = true;
 
     fn alignedAlloc(heap: *mimalloc.Heap, len: usize, alignment: usize) ?[*]u8 {
-        if (comptime FeatureFlags.log_allocations) std.debug.print("Malloc: {d}\n", .{len});
+        log("Malloc: {d}\n", .{len});
 
         const ptr: ?*anyopaque = if (mimalloc.canUseAlignedAlloc(len, alignment))
             mimalloc.mi_heap_malloc_aligned(heap, len, alignment)

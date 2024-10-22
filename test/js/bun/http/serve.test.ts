@@ -1,13 +1,14 @@
 import { file, gc, Serve, serve, Server } from "bun";
-import { afterEach, describe, it, expect, afterAll, mock } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { readFileSync, writeFileSync } from "fs";
+import { bunEnv, bunExe, dumpStats, isIPv4, isIPv6, isPosix, tls, tmpdirSync } from "harness";
 import { join, resolve } from "path";
-import { bunExe, bunEnv, dumpStats } from "harness";
 // import { renderToReadableStream } from "react-dom/server";
 // import app_jsx from "./app.jsx";
-import { spawn } from "child_process";
-import { tmpdir } from "os";
 import { heapStats } from "bun:jsc";
+import { spawn } from "child_process";
+import net from "node:net";
+import { tmpdir } from "os";
 
 let renderToReadableStream: any = null;
 let app_jsx: any = null;
@@ -27,7 +28,6 @@ async function runTest({ port, ...serverOptions }: Serve<any>, test: (server: Se
     while (!server) {
       try {
         server = serve({ ...serverOptions, port: 0 });
-        console.log(`Server: ${server.url}`);
         break;
       } catch (e: any) {
         console.log("catch:", e);
@@ -48,6 +48,171 @@ afterAll(() => {
   }
 });
 
+it("should be able to abruptly stop the server many times", async () => {
+  async function run() {
+    const stopped = Promise.withResolvers();
+    const server = Bun.serve({
+      port: 0,
+      error() {
+        return new Response("Error", { status: 500 });
+      },
+      async fetch(req, server) {
+        await Bun.sleep(50);
+        server.stop(true);
+        await Bun.sleep(50);
+        server = undefined;
+        if (stopped.resolve) {
+          stopped.resolve();
+          stopped.resolve = undefined;
+        }
+
+        return new Response("Hello, World!");
+      },
+    });
+    const url = server.url;
+
+    async function request() {
+      try {
+        await fetch(url, { keepalive: true }).then(res => res.text());
+        expect.unreachable();
+      } catch (e) {
+        expect(["ConnectionClosed", "ConnectionRefused"]).toContain(e.code);
+      }
+    }
+
+    const requests = new Array(20);
+    for (let i = 0; i < 20; i++) {
+      requests[i] = request();
+    }
+    await Promise.all(requests);
+    await stopped.promise;
+    Bun.gc(true);
+  }
+  const runs = new Array(10);
+  for (let i = 0; i < 10; i++) {
+    runs[i] = run();
+  }
+
+  await Promise.all(runs);
+  Bun.gc(true);
+});
+
+// This test reproduces a crash in Bun v1.1.18 and earlier
+it("should be able to abruptly stop the server", async () => {
+  for (let i = 0; i < 2; i++) {
+    const controller = new AbortController();
+
+    using server = Bun.serve({
+      port: 0,
+      error() {
+        return new Response("Error", { status: 500 });
+      },
+      async fetch(req, server) {
+        server.stop(true);
+        await Bun.sleep(10);
+        return new Response();
+      },
+    });
+
+    await fetch(server.url, {
+      signal: controller.signal,
+    })
+      .then(res => {
+        return res.blob();
+      })
+      .catch(() => {});
+  }
+});
+
+// https://github.com/oven-sh/bun/issues/6758
+// https://github.com/oven-sh/bun/issues/4517
+it("should call cancel() on ReadableStream when the Request is aborted", async () => {
+  let waitForCancel = Promise.withResolvers();
+  const abortedFn = mock(() => {
+    console.log("'abort' event fired", new Date());
+  });
+  const cancelledFn = mock(() => {
+    console.log("'cancel' function called", new Date());
+    waitForCancel.resolve();
+  });
+  let onIncomingRequest = Promise.withResolvers();
+  await runTest(
+    {
+      async fetch(req) {
+        req.signal.addEventListener("abort", abortedFn);
+        // Give it a chance to start the stream so that the cancel function can be called.
+        setTimeout(() => {
+          console.log("'onIncomingRequest' function called", new Date());
+          onIncomingRequest.resolve();
+        }, 0);
+        return new Response(
+          new ReadableStream({
+            async pull(controller) {
+              await waitForCancel.promise;
+            },
+            cancel: cancelledFn,
+          }),
+        );
+      },
+    },
+    async server => {
+      const controller = new AbortController();
+      const signal = controller.signal;
+      const request = fetch(server.url, { signal });
+      await onIncomingRequest.promise;
+      controller.abort();
+      expect(async () => await request).toThrow();
+      // Delay for one run of the event loop.
+      await Bun.sleep(1);
+
+      expect(abortedFn).toHaveBeenCalled();
+      expect(cancelledFn).toHaveBeenCalled();
+    },
+  );
+});
+for (let withDelay of [true, false]) {
+  for (let connectionHeader of ["keepalive", "not keepalive"] as const) {
+    it(`should NOT call cancel() on ReadableStream that finished normally for ${connectionHeader} request and ${withDelay ? "with" : "without"} delay`, async () => {
+      const cancelledFn = mock(() => {
+        console.log("'cancel' function called", new Date());
+      });
+      let onIncomingRequest = Promise.withResolvers();
+      await runTest(
+        {
+          async fetch(req) {
+            return new Response(
+              new ReadableStream({
+                async pull(controller) {
+                  controller.enqueue(new Uint8Array([1, 2, 3]));
+                  if (withDelay) await Bun.sleep(1);
+                  controller.close();
+                },
+                cancel: cancelledFn,
+              }),
+            );
+          },
+        },
+        async server => {
+          const resp = await fetch(
+            server.url,
+            connectionHeader === "keepalive"
+              ? {}
+              : {
+                  headers: {
+                    "Connection": "close",
+                  },
+                  keepalive: false,
+                },
+          );
+          await resp.blob();
+          // Delay for one run of the event loop.
+          await Bun.sleep(1);
+          expect(cancelledFn).not.toHaveBeenCalled();
+        },
+      );
+    });
+  }
+}
 describe("1000 uploads & downloads in batches of 64 do not leak ReadableStream", () => {
   for (let isDirect of [true, false] as const) {
     it(
@@ -91,7 +256,10 @@ describe("1000 uploads & downloads in batches of 64 do not leak ReadableStream",
           async server => {
             const count = 1000;
             async function callback() {
-              const response = await fetch(server.url, { body: blob, method: "POST" });
+              const response = await fetch(server.url, {
+                body: blob,
+                method: "POST",
+              });
 
               // We are testing for ReadableStream leaks, so we use the ReadableStream here.
               const chunks = [];
@@ -203,7 +371,9 @@ it("request.signal works in trivial case", async () => {
     },
     async server => {
       expect(async () => {
-        const response = await fetch(server.url.origin, { signal: aborty.signal });
+        const response = await fetch(server.url.origin, {
+          signal: aborty.signal,
+        });
         await signaler.promise;
         await response.blob();
       }).toThrow("The operation was aborted.");
@@ -1006,7 +1176,9 @@ describe("should support Content-Range with Bun.file()", () => {
       const end = Number(searchParams.get("end"));
       const file = Bun.file(fixture);
       return new Response(file.slice(start, end), {
-        headers: { "Content-Range": "bytes " + start + "-" + end + "/" + file.size },
+        headers: {
+          "Content-Range": "bytes " + start + "-" + end + "/" + file.size,
+        },
       });
     },
   });
@@ -1097,16 +1269,27 @@ describe("should support Content-Range with Bun.file()", () => {
 });
 
 it("formats error responses correctly", async () => {
-  const c = spawn(bunExe(), ["./error-response.js"], { cwd: import.meta.dir, env: bunEnv });
+  const { promise, resolve, reject } = Promise.withResolvers();
+  const c = spawn(bunExe(), ["./error-response.js"], {
+    cwd: import.meta.dir,
+    env: bunEnv,
+  });
 
   var output = "";
   c.stderr.on("data", chunk => {
     output += chunk.toString();
   });
   c.stderr.on("end", () => {
-    expect(output).toContain('throw new Error("1");');
-    c.kill();
+    try {
+      expect(output).toContain('throw new Error("1");');
+      resolve();
+    } catch (e) {
+      reject(e);
+    } finally {
+      c.kill();
+    }
   });
+  await promise;
 });
 
 it("request body and signal life cycle", async () => {
@@ -1256,9 +1439,10 @@ it("#5859 json", async () => {
     port: 0,
     async fetch(req) {
       try {
-        await req.json();
+        const json = await req.json();
+        console.log({ json });
       } catch (e) {
-        return new Response("FAIL", { status: 500 });
+        return new Response(e?.message!, { status: 500 });
       }
 
       return new Response("SHOULD'VE FAILED", {});
@@ -1270,16 +1454,17 @@ it("#5859 json", async () => {
     body: new Uint8Array([0xfd]),
   });
 
+  expect(await response.text()).toBe("Failed to parse JSON");
   expect(response.ok).toBeFalse();
-  expect(await response.text()).toBe("FAIL");
 });
 
 it("#5859 arrayBuffer", async () => {
-  await Bun.write("/tmp/bad", new Uint8Array([0xfd]));
-  expect(async () => await Bun.file("/tmp/bad").json()).toThrow();
+  const tmp = join(tmpdirSync(), "bad");
+  await Bun.write(tmp, new Uint8Array([0xfd]));
+  expect(async () => await Bun.file(tmp).json()).toThrow();
 });
 
-it("server.requestIP (v4)", async () => {
+it.if(isIPv4())("server.requestIP (v4)", async () => {
   using server = Bun.serve({
     port: 0,
     fetch(req, server) {
@@ -1296,7 +1481,7 @@ it("server.requestIP (v4)", async () => {
   });
 });
 
-it("server.requestIP (v6)", async () => {
+it.if(isIPv6())("server.requestIP (v6)", async () => {
   using server = Bun.serve({
     port: 0,
     fetch(req, server) {
@@ -1313,8 +1498,8 @@ it("server.requestIP (v6)", async () => {
   });
 });
 
-it("server.requestIP (unix)", async () => {
-  const unix = "/tmp/bun-serve.sock";
+it.if(isPosix)("server.requestIP (unix)", async () => {
+  const unix = join(tmpdirSync(), "serve.sock");
   using server = Bun.serve({
     unix,
     fetch(req, server) {
@@ -1464,6 +1649,24 @@ describe("should error with invalid options", async () => {
       });
     }).toThrow("Expected lowMemoryMode to be a boolean");
   });
+  it("multiple missing server name", () => {
+    expect(() => {
+      Bun.serve({
+        port: 0,
+        fetch(req) {
+          return new Response("hi");
+        },
+        tls: [
+          {
+            key: "lkwejflkwjeflkj",
+          },
+          {
+            key: "lkwjefhwlkejfklwj",
+          },
+        ],
+      });
+    }).toThrow("SNI tls object must have a serverName");
+  });
 });
 it("should resolve pending promise if requested ended with pending read", async () => {
   let error: Error;
@@ -1478,7 +1681,7 @@ it("should resolve pending promise if requested ended with pending read", async 
     {
       fetch(req) {
         // @ts-ignore
-        req.body?.getReader().read().catch(shouldError).then(shouldMarkDone);
+        req.body?.getReader().read().then(shouldMarkDone).catch(shouldError);
         return new Response("OK");
       },
     },
@@ -1489,8 +1692,9 @@ it("should resolve pending promise if requested ended with pending read", async 
       });
       const text = await response.text();
       expect(text).toContain("OK");
-      expect(is_done).toBe(true);
-      expect(error).toBeUndefined();
+      expect(is_done).toBe(false);
+      expect(error).toBeDefined();
+      expect(error.name).toContain("AbortError");
     },
   );
 });
@@ -1509,3 +1713,363 @@ it("should work with dispose keyword", async () => {
   }
   expect(fetch(url)).rejects.toThrow();
 });
+
+// prettier-ignore
+it("should be able to stop in the middle of a file response", async () => {
+  async function doRequest(url: string) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(10) });
+      const read = (response.body as ReadableStream<any>).getReader();
+      while (true) {
+        const { value, done } = await read.read();
+        if (done) break;
+      }
+      expect(response.status).toBe(200);
+    } catch {}
+  }
+  const fixture = join(import.meta.dir, "server-bigfile-send.fixture.js");
+  for (let i = 0; i < 3; i++) {
+    const process = Bun.spawn([bunExe(), fixture], {
+      env: bunEnv,
+      stderr: "inherit",
+      stdout: "pipe",
+      stdin: "ignore",
+    });
+    const { value } = await process.stdout.getReader().read();
+    const url = new TextDecoder().decode(value).trim();
+    const requests = [];
+    for (let j = 0; j < 5_000; j++) {
+      requests.push(doRequest(url));
+    }
+    // only await for 1k requests (and kill the process)
+    await Promise.all(requests.slice(0, 1_000));
+    expect(process.exitCode || 0).toBe(0);
+    process.kill();
+  }
+}, 60_000);
+
+it("should be able to abrupt stop the server", async () => {
+  for (let i = 0; i < 10; i++) {
+    using server = Bun.serve({
+      port: 0,
+      error() {
+        return new Response("Error", { status: 500 });
+      },
+      async fetch(req, server) {
+        server.stop(true);
+        await Bun.sleep(100);
+        return new Response("Hello, World!");
+      },
+    });
+
+    try {
+      await fetch(server.url).then(res => res.text());
+      expect.unreachable();
+    } catch (e) {
+      expect(e.code).toBe("ConnectionClosed");
+    }
+  }
+});
+
+it("should not instanciate error instances in each request", async () => {
+  const startErrorCount = heapStats().objectTypeCounts.Error || 0;
+  using server = Bun.serve({
+    port: 0,
+    async fetch(req, server) {
+      return new Response("bun");
+    },
+  });
+  const batchSize = 100;
+  const batch = new Array(batchSize);
+  for (let i = 0; i < 1000; i++) {
+    batch[i % batchSize] = await fetch(server.url, {
+      method: "POST",
+      body: "bun",
+    });
+    if (i % batchSize === batchSize - 1) {
+      await Promise.all(batch);
+    }
+  }
+  expect(heapStats().objectTypeCounts.Error || 0).toBeLessThanOrEqual(startErrorCount);
+});
+
+it("should be able to abort a sendfile response and streams", async () => {
+  const bigfile = join(import.meta.dir, "../../web/encoding/utf8-encoding-fixture.bin");
+  using server = serve({
+    port: 0,
+    tls,
+    hostname: "localhost",
+    async fetch() {
+      return new Response(file(bigfile), {
+        headers: { "Content-Type": "text/html" },
+      });
+    },
+  });
+
+  async function doRequest() {
+    try {
+      const controller = new AbortController();
+      const res = await fetch(server.url, {
+        signal: controller.signal,
+        tls: { rejectUnauthorized: false },
+      });
+      res.body
+        ?.getReader()
+        .read()
+        .catch(() => {});
+      controller.abort();
+    } catch {}
+  }
+  const batchSize = 20;
+  const batch = [];
+
+  for (let i = 0; i < 500; i++) {
+    batch.push(doRequest());
+    if (batch.length === batchSize) {
+      await Promise.all(batch);
+      batch.length = 0;
+    }
+  }
+  await Promise.all(batch);
+  expect().pass();
+}, 10_000);
+
+it("should not send extra bytes when using sendfile", async () => {
+  const payload = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  const tmpFile = join(tmpdirSync(), "test.bin");
+  await Bun.write(tmpFile, payload);
+  using serve = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const pathname = new URL(req.url).pathname;
+      if (pathname === "/file") {
+        return new Response(Bun.file(tmpFile), {
+          headers: {
+            "Content-Type": "plain/text",
+          },
+        });
+      }
+      return new Response("Not Found", {
+        status: 404,
+      });
+    },
+  });
+
+  // manually fetch the file using sockets, and get the whole content
+  const { promise, resolve, reject } = Promise.withResolvers();
+  const socket = net.connect(serve.port, "localhost", () => {
+    socket.write("GET /file HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    setTimeout(() => {
+      socket.end(); // wait a bit before closing the connection so we get the whole content
+    }, 100);
+  });
+
+  let body: Buffer | null = null;
+  let content_length = 0;
+  let headers = "";
+
+  socket.on("data", data => {
+    if (body) {
+      body = Buffer.concat([body as Buffer, data]);
+
+      return;
+    }
+    // parse headers
+    const str = data.toString("utf8");
+    const index = str.indexOf("\r\n\r\n");
+    if (index === -1) {
+      headers += str;
+      return;
+    }
+    headers += str.slice(0, index);
+    const lines = headers.split("\r\n");
+    for (const line of lines) {
+      const [key, value] = line.split(": ");
+      if (key.toLowerCase() === "content-length") {
+        content_length = Number.parseInt(value, 10);
+      }
+    }
+    body = data.subarray(index + 4);
+  });
+  socket.on("error", reject);
+  socket.on("close", () => {
+    resolve(body);
+  });
+
+  expect(await promise).toEqual(Buffer.from(payload));
+  expect(content_length).toBe(payload.byteLength);
+});
+
+it("we should always send date", async () => {
+  const payload = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  const tmpFile = join(tmpdirSync(), "test.bin");
+  await Bun.write(tmpFile, payload);
+  using serve = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const pathname = new URL(req.url).pathname;
+      if (pathname === "/file") {
+        return new Response(Bun.file(tmpFile), {
+          headers: {
+            "Content-Type": "plain/text",
+          },
+        });
+      }
+      if (pathname === "/file2") {
+        return new Response(Bun.file(tmpFile));
+      }
+      if (pathname === "/stream") {
+        return new Response(
+          new ReadableStream({
+            async pull(controller) {
+              await Bun.sleep(10);
+              controller.enqueue(payload);
+              await Bun.sleep(10);
+              controller.close();
+            },
+          }),
+        );
+      }
+      return new Response("Hello, World!");
+    },
+  });
+
+  {
+    const res = await fetch(new URL("/file", serve.url.origin));
+    expect(res.headers.has("Date")).toBeTrue();
+  }
+  {
+    const res = await fetch(new URL("/file2", serve.url.origin));
+    expect(res.headers.has("Date")).toBeTrue();
+  }
+
+  {
+    const res = await fetch(new URL("/", serve.url.origin));
+    expect(res.headers.has("Date")).toBeTrue();
+  }
+  {
+    const res = await fetch(new URL("/stream", serve.url.origin));
+    expect(res.headers.has("Date")).toBeTrue();
+  }
+});
+
+it("should allow use of custom timeout", async () => {
+  using server = Bun.serve({
+    port: 0,
+    idleTimeout: 8, // uws precision is in seconds, and lower than 4 seconds is not reliable its timer is not that accurate
+    async fetch(req) {
+      const url = new URL(req.url);
+      return new Response(
+        new ReadableStream({
+          async pull(controller) {
+            controller.enqueue("Hello,");
+            if (url.pathname === "/timeout") {
+              await Bun.sleep(10000);
+            } else {
+              await Bun.sleep(10);
+            }
+            controller.enqueue(" World!");
+
+            controller.close();
+          },
+        }),
+        { headers: { "Content-Type": "text/plain" } },
+      );
+    },
+  });
+  async function testTimeout(pathname: string, success: boolean) {
+    const res = await fetch(new URL(pathname, server.url.origin));
+    expect(res.status).toBe(200);
+    if (success) {
+      expect(res.text()).resolves.toBe("Hello, World!");
+    } else {
+      expect(res.text()).rejects.toThrow(/The socket connection was closed unexpectedly./);
+    }
+  }
+  await Promise.all([testTimeout("/ok", true), testTimeout("/timeout", false)]);
+}, 15_000);
+
+it("should reset timeout after writes", async () => {
+  // the default is 10s so we send 15
+  // this test should take 15s at most
+  const CHUNKS = 15;
+  const payload = Buffer.from(`data: ${Date.now()}\n\n`);
+  using server = Bun.serve({
+    idleTimeout: 5,
+    port: 0,
+    fetch(request, server) {
+      let controller!: ReadableStreamDefaultController;
+      let count = CHUNKS;
+      let interval = setInterval(() => {
+        controller.enqueue(payload);
+        count--;
+        if (count == 0) {
+          clearInterval(interval);
+          interval = null;
+          controller.close();
+          return;
+        }
+      }, 1000);
+      return new Response(
+        new ReadableStream({
+          start(_controller) {
+            controller = _controller;
+          },
+          cancel(controller) {
+            if (interval) clearInterval(interval);
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+          },
+        },
+      );
+    },
+  });
+  let received = 0;
+  const response = await fetch(server.url);
+  const stream = response.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await stream.read();
+    received += value?.length || 0;
+    if (done) break;
+  }
+
+  expect(received).toBe(CHUNKS * payload.byteLength);
+}, 20_000);
+
+it("allow requestIP after async operation", async () => {
+  using server = Bun.serve({
+    port: 0,
+    async fetch(req, server) {
+      await Bun.sleep(1);
+      return new Response(JSON.stringify(server.requestIP(req)));
+    },
+  });
+
+  const ip = await fetch(server.url).then(res => res.json());
+  expect(ip).not.toBeNull();
+  expect(ip.port).toBeInteger();
+  expect(ip.address).toBeString();
+  expect(ip.family).toBeString();
+});
+
+it("allow custom timeout per request", async () => {
+  using server = Bun.serve({
+    idleTimeout: 1,
+    port: 0,
+    async fetch(req, server) {
+      server.timeout(req, 60);
+      await Bun.sleep(10000); //uWS precision is not great
+
+      return new Response("Hello, World!");
+    },
+  });
+  expect(server.timeout).toBeFunction();
+  const res = await fetch(new URL("/long-timeout", server.url.origin));
+  expect(res.status).toBe(200);
+  expect(res.text()).resolves.toBe("Hello, World!");
+}, 20_000);

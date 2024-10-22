@@ -1,5 +1,5 @@
-import { expect, it, describe } from "bun:test";
-import { pathToFileURL, fileURLToPath } from "bun";
+import { fileURLToPath, pathToFileURL } from "bun";
+import { describe, expect, it } from "bun:test";
 import { isWindows } from "harness";
 
 describe("pathToFileURL", () => {
@@ -41,5 +41,11 @@ describe("fileURLToPath", () => {
   it("should add absolute part to relative file (#6456)", () => {
     const url = pathToFileURL("foo.txt");
     expect(url.href).toBe(`${pathToFileURL(process.cwd())}/foo.txt`);
+  });
+
+  it("should roundtrip", () => {
+    const url = pathToFileURL(import.meta.path);
+    expect(fileURLToPath(url)).toBe(import.meta.path);
+    expect(fileURLToPath(import.meta.url)).toBe(import.meta.path);
   });
 });

@@ -69,6 +69,7 @@ pub const advapi32 = windows.advapi32;
 pub const INVALID_FILE_ATTRIBUTES: u32 = std.math.maxInt(u32);
 
 pub const nt_object_prefix = [4]u16{ '\\', '?', '?', '\\' };
+pub const nt_unc_object_prefix = [8]u16{ '\\', '?', '?', '\\', 'U', 'N', 'C', '\\' };
 pub const nt_maxpath_prefix = [4]u16{ '\\', '\\', '?', '\\' };
 
 const std = @import("std");
@@ -97,9 +98,18 @@ pub extern "kernel32" fn CommandLineToArgvW(
     pNumArgs: *c_int,
 ) callconv(windows.WINAPI) ?[*]win32.LPWSTR;
 
-pub extern fn GetFileType(
-    hFile: win32.HANDLE,
-) callconv(windows.WINAPI) win32.DWORD;
+pub fn GetFileType(hFile: win32.HANDLE) win32.DWORD {
+    const function = struct {
+        pub extern fn GetFileType(
+            hFile: win32.HANDLE,
+        ) callconv(windows.WINAPI) win32.DWORD;
+    }.GetFileType;
+
+    const rc = function(hFile);
+    if (comptime Environment.enable_logs)
+        bun.sys.syslog("GetFileType({}) = {d}", .{ bun.toFD(hFile), rc });
+    return rc;
+}
 
 /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfiletype#return-value
 pub const FILE_TYPE_UNKNOWN = 0x0000;
@@ -3047,6 +3057,7 @@ pub fn translateNTStatusToErrno(err: win32.NTSTATUS) bun.C.E {
         .DIRECTORY_NOT_EMPTY => .NOTEMPTY,
         .FILE_TOO_LARGE => .@"2BIG",
         .NOT_SAME_DEVICE => .XDEV,
+        .DELETE_PENDING => .BUSY,
         .SHARING_VIOLATION => if (comptime Environment.isDebug) brk: {
             bun.Output.debugWarn("Received SHARING_VIOLATION, indicates file handle should've been opened with FILE_SHARE_DELETE", .{});
             break :brk .BUSY;
@@ -3058,9 +3069,9 @@ pub fn translateNTStatusToErrno(err: win32.NTSTATUS) bun.C.E {
         } else .INVAL,
 
         else => |t| {
-            // if (bun.Environment.isDebug) {
-            bun.Output.warn("Called translateNTStatusToErrno with {s} which does not have a mapping to errno.", .{@tagName(t)});
-            // }
+            if (bun.Environment.isDebug) {
+                bun.Output.warn("Called translateNTStatusToErrno with {s} which does not have a mapping to errno.", .{@tagName(t)});
+            }
             return .UNKNOWN;
         },
     };
@@ -3396,8 +3407,31 @@ pub fn GetFinalPathNameByHandle(
     fmt: std.os.windows.GetFinalPathNameByHandleFormat,
     out_buffer: []u16,
 ) std.os.windows.GetFinalPathNameByHandleError![]u16 {
-    bun.sys.syslog("GetFinalPathNameByHandle({*p})", .{hFile});
-    return std.os.windows.GetFinalPathNameByHandle(hFile, fmt, out_buffer);
+    const return_length = bun.windows.GetFinalPathNameByHandleW(hFile, out_buffer.ptr, @truncate(out_buffer.len), switch (fmt.volume_name) {
+        .Dos => win32.FILE_NAME_NORMALIZED | win32.VOLUME_NAME_DOS,
+        .Nt => win32.FILE_NAME_NORMALIZED | win32.VOLUME_NAME_NT,
+    });
+
+    if (return_length == 0) {
+        bun.sys.syslog("GetFinalPathNameByHandleW({*p}) = {}", .{ hFile, bun.windows.GetLastError() });
+        return error.FileNotFound;
+    }
+
+    var ret = out_buffer[0..@intCast(return_length)];
+
+    bun.sys.syslog("GetFinalPathNameByHandleW({*p}) = {}", .{ hFile, bun.fmt.utf16(ret) });
+
+    if (bun.strings.hasPrefixComptimeType(u16, ret, nt_maxpath_prefix)) {
+        // '\\?\C:\absolute\path' -> 'C:\absolute\path'
+        ret = ret[4..];
+        if (bun.strings.hasPrefixComptimeUTF16(ret, "UNC\\")) {
+            // '\\?\UNC\absolute\path' -> '\\absolute\path'
+            ret[2] = '\\';
+            ret = ret[2..];
+        }
+    }
+
+    return ret;
 }
 
 extern "kernel32" fn GetModuleHandleExW(

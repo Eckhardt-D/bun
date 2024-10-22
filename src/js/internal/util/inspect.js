@@ -31,6 +31,7 @@
 // IN THE SOFTWARE.
 
 const { pathToFileURL } = require("node:url");
+let BufferModule;
 
 const primordials = require("internal/primordials");
 const {
@@ -2071,6 +2072,11 @@ function formatArray(ctx, value, recurseTimes) {
 }
 
 function formatTypedArray(value, length, ctx, ignored, recurseTimes) {
+  if (Buffer.isBuffer(value)) {
+    BufferModule ??= require("node:buffer");
+    const INSPECT_MAX_BYTES = $requireMap.$get("buffer")?.exports.INSPECT_MAX_BYTES ?? BufferModule.INSPECT_MAX_BYTES;
+    ctx.maxArrayLength = MathMin(ctx.maxArrayLength, INSPECT_MAX_BYTES);
+  }
   const maxLength = MathMin(MathMax(0, ctx.maxArrayLength), length);
   const remaining = value.length - maxLength;
   const output = new Array(maxLength);
@@ -2637,7 +2643,7 @@ function previewEntries(val, isIterator = false) {
     const iteratedObject = $getInternalField(val, 1 /*iteratorFieldIteratedObject*/);
     // for Maps: 0 = keys, 1 = values,      2 = entries
     // for Sets:           1 = keys|values, 2 = entries
-    const kind = $getInternalField(val, 2 /*iteratorFieldKind*/);
+    const kind = $getInternalField(val, 3 /*iteratorFieldKind*/);
     const isEntries = kind === 2;
     // TODO(bun): improve performance by not using Array.from and instead using the iterator directly to only get the first
     // few entries which will actually be displayed (this requires changing some logic in the call sites of this function)

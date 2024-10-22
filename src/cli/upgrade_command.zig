@@ -30,7 +30,7 @@ const bundler = bun.bundler;
 const fs = @import("../fs.zig");
 const URL = @import("../url.zig").URL;
 const HTTP = bun.http;
-const ParseJSON = @import("../json_parser.zig").ParseJSONUTF8;
+const JSON = bun.JSON;
 const Archive = @import("../libarchive/libarchive.zig").Archive;
 const Zlib = @import("../zlib.zig");
 const JSPrinter = bun.js_printer;
@@ -45,8 +45,8 @@ pub var initialized_store = false;
 pub fn initializeStore() void {
     if (initialized_store) return;
     initialized_store = true;
-    js_ast.Expr.Data.Store.create(default_allocator);
-    js_ast.Stmt.Data.Store.create(default_allocator);
+    js_ast.Expr.Data.Store.create();
+    js_ast.Stmt.Data.Store.create();
 }
 
 pub const Version = struct {
@@ -133,7 +133,7 @@ pub const UpgradeCheckerThread = struct {
         std.time.sleep(std.time.ns_per_ms * delay);
 
         Output.Source.configureThread();
-        try HTTP.HTTPThread.init();
+        HTTP.HTTPThread.init(&.{});
 
         defer {
             js_ast.Expr.Data.Store.deinit();
@@ -163,7 +163,6 @@ pub const UpgradeCheckerThread = struct {
 };
 
 pub const UpgradeCommand = struct {
-    pub const timeout: u32 = 30000;
     const default_github_headers: string = "Acceptapplication/vnd.github.v3+json";
     var github_repository_url_buf: bun.PathBuffer = undefined;
     var current_executable_buf: bun.PathBuffer = undefined;
@@ -245,15 +244,14 @@ pub const UpgradeCommand = struct {
             headers_buf,
             &metadata_body,
             "",
-            60 * std.time.ns_per_min,
             http_proxy,
             null,
             HTTP.FetchRedirect.follow,
         );
-        async_http.client.reject_unauthorized = env_loader.getTLSRejectUnauthorized();
+        async_http.client.flags.reject_unauthorized = env_loader.getTLSRejectUnauthorized();
 
         if (!silent) async_http.client.progress_node = progress.?;
-        const response = try async_http.sendSync(true);
+        const response = try async_http.sendSync();
 
         switch (response.status_code) {
             404 => return error.HTTP404,
@@ -268,7 +266,7 @@ pub const UpgradeCommand = struct {
         defer if (comptime silent) log.deinit();
         var source = logger.Source.initPathString("releases.json", metadata_body.list.items);
         initializeStore();
-        var expr = ParseJSON(&source, &log, allocator) catch |err| {
+        var expr = JSON.parseUTF8(&source, &log, allocator) catch |err| {
             if (!silent) {
                 progress.?.end();
                 refresher.?.refresh();
@@ -442,7 +440,7 @@ pub const UpgradeCommand = struct {
     }
 
     fn _exec(ctx: Command.Context) !void {
-        try HTTP.HTTPThread.init();
+        HTTP.HTTPThread.init(&.{});
 
         var filesystem = try fs.FileSystem.init(null);
         var env_loader: DotEnv.Loader = brk: {
@@ -528,16 +526,14 @@ pub const UpgradeCommand = struct {
                 "",
                 zip_file_buffer,
                 "",
-                timeout,
                 http_proxy,
                 null,
                 HTTP.FetchRedirect.follow,
             );
-            async_http.client.timeout = timeout;
             async_http.client.progress_node = progress;
-            async_http.client.reject_unauthorized = env_loader.getTLSRejectUnauthorized();
+            async_http.client.flags.reject_unauthorized = env_loader.getTLSRejectUnauthorized();
 
-            const response = try async_http.sendSync(true);
+            const response = try async_http.sendSync();
 
             switch (response.status_code) {
                 404 => {
@@ -563,7 +559,7 @@ pub const UpgradeCommand = struct {
                 else => return error.HTTPError,
             }
 
-            const bytes = zip_file_buffer.toOwnedSliceLeaky();
+            const bytes = zip_file_buffer.slice();
 
             progress.end();
             refresher.refresh();
@@ -656,10 +652,10 @@ pub const UpgradeCommand = struct {
                     // Run a powershell script to unzip the file
                     const unzip_script = try std.fmt.allocPrint(
                         ctx.allocator,
-                        "$global:ProgressPreference='SilentlyContinue';Expand-Archive -Path {s} {s} -Force",
+                        "$global:ProgressPreference='SilentlyContinue';Expand-Archive -Path \"{}\" \"{}\" -Force",
                         .{
-                            tmpname,
-                            tmpdir_path,
+                            bun.fmt.escapePowershell(tmpname),
+                            bun.fmt.escapePowershell(tmpdir_path),
                         },
                     );
 
@@ -1000,7 +996,7 @@ pub const upgrade_js_bindings = struct {
 
     /// For testing upgrades when the temp directory has an open handle without FILE_SHARE_DELETE.
     /// Windows only
-    pub fn jsOpenTempDirWithoutSharingDelete(_: *JSC.JSGlobalObject, _: *JSC.CallFrame) callconv(.C) bun.JSC.JSValue {
+    pub fn jsOpenTempDirWithoutSharingDelete(_: *JSC.JSGlobalObject, _: *JSC.CallFrame) bun.JSC.JSValue {
         if (comptime !Environment.isWindows) return .undefined;
         const w = std.os.windows;
 
@@ -1054,7 +1050,7 @@ pub const upgrade_js_bindings = struct {
         return .undefined;
     }
 
-    pub fn jsCloseTempDirHandle(_: *JSC.JSGlobalObject, _: *JSC.CallFrame) callconv(.C) JSValue {
+    pub fn jsCloseTempDirHandle(_: *JSC.JSGlobalObject, _: *JSC.CallFrame) JSValue {
         if (comptime !Environment.isWindows) return .undefined;
 
         if (tempdir_fd) |fd| {

@@ -1,6 +1,11 @@
-// ** Update the version number when any breaking changes are made to the cache format or to the JS parser **
-// Version 2 -> 3: "Infinity" becomes "1/0".
-const expected_version = 3;
+/// ** Update the version number when any breaking changes are made to the cache format or to the JS parser **
+/// Version 3: "Infinity" becomes "1/0".
+/// Version 4: TypeScript enums are properly handled + more constant folding
+/// Version 5: `require.main === module` no longer marks a module as CJS
+/// Version 6: `use strict` is preserved in CommonJS modules when at the top of the file
+/// Version 7: Several bundler changes that are likely to impact the runtime as well.
+/// Version 8: Fix for generated symbols
+const expected_version = 8;
 
 const bun = @import("root").bun;
 const std = @import("std");
@@ -200,10 +205,10 @@ pub const RuntimeTranspilerCache = struct {
 
                     try metadata.encode(metadata_stream.writer());
 
-                    if (comptime bun.Environment.allow_assert) {
+                    if (comptime bun.Environment.isDebug) {
                         var metadata_stream2 = std.io.fixedBufferStream(metadata_buf[0..Metadata.size]);
                         var metadata2 = Metadata{};
-                        metadata2.decode(metadata_stream2.reader()) catch |err| bun.Output.panic("Metadata did not rountrip encode -> decode  successfully: {s}", .{@errorName(err)});
+                        metadata2.decode(metadata_stream2.reader()) catch |err| bun.Output.panic("Metadata did not roundtrip encode -> decode  successfully: {s}", .{@errorName(err)});
                         bun.assert(std.meta.eql(metadata, metadata2));
                     }
 

@@ -55,7 +55,6 @@ const default_transform_options: Api.TransformOptions = brk: {
     var opts = std.mem.zeroes(Api.TransformOptions);
     opts.disable_hmr = true;
     opts.target = Api.Target.browser;
-    opts.serve = false;
     break :brk opts;
 };
 
@@ -140,10 +139,9 @@ pub const TransformTask = struct {
             .allocator = allocator,
         };
         ast_memory_allocator.reset();
+
         JSAst.Stmt.Data.Store.memory_allocator = ast_memory_allocator;
         JSAst.Expr.Data.Store.memory_allocator = ast_memory_allocator;
-        JSAst.Stmt.Data.Store.create(bun.default_allocator);
-        JSAst.Expr.Data.Store.create(bun.default_allocator);
 
         defer {
             JSAst.Stmt.Data.Store.reset();
@@ -248,6 +246,9 @@ pub const TransformTask = struct {
         this.log.deinit();
         this.input_code.deinitAndUnprotect();
         this.output_code.deref();
+        if (this.tsconfig) |tsconfig| {
+            tsconfig.destroy();
+        }
 
         this.destroy();
     }
@@ -328,7 +329,7 @@ fn transformOptionsFromJSC(globalObject: JSC.C.JSContextRef, temp_allocator: std
         return transpiler;
     }
 
-    if (object.getIfPropertyExists(globalObject, "define")) |define| {
+    if (object.getTruthy(globalObject, "define")) |define| {
         define: {
             if (define.isUndefinedOrNull()) {
                 break :define;
@@ -481,7 +482,7 @@ fn transformOptionsFromJSC(globalObject: JSC.C.JSContextRef, temp_allocator: std
         else => false,
     };
 
-    if (object.getIfPropertyExists(globalThis, "macro")) |macros| {
+    if (object.getTruthy(globalThis, "macro")) |macros| {
         macros: {
             if (macros.isUndefinedOrNull()) break :macros;
             if (macros.isBoolean()) {
@@ -522,19 +523,6 @@ fn transformOptionsFromJSC(globalObject: JSC.C.JSContextRef, temp_allocator: std
 
     if (object.getOptional(globalThis, "allowBunRuntime", bool) catch return transpiler) |flag| {
         transpiler.runtime.allow_runtime = flag;
-    }
-
-    if (object.getOptional(globalThis, "jsxOptimizationInline", bool) catch return transpiler) |flag| {
-        transpiler.runtime.jsx_optimization_inline = flag;
-    }
-
-    if (object.getOptional(globalThis, "jsxOptimizationHoist", bool) catch return transpiler) |flag| {
-        transpiler.runtime.jsx_optimization_hoist = flag;
-
-        if (!transpiler.runtime.jsx_optimization_inline and transpiler.runtime.jsx_optimization_hoist) {
-            JSC.throwInvalidArguments("jsxOptimizationHoist requires jsxOptimizationInline", .{}, globalObject, exception);
-            return transpiler;
-        }
     }
 
     if (object.getOptional(globalThis, "inline", bool) catch return transpiler) |flag| {
@@ -585,6 +573,10 @@ fn transformOptionsFromJSC(globalObject: JSC.C.JSContextRef, temp_allocator: std
                 return transpiler;
             }
         }
+    }
+
+    if (try object.getOptionalEnum(globalThis, "packages", options.PackagesOption)) |packages| {
+        transpiler.transform.packages = packages.toAPI();
     }
 
     var tree_shaking: ?bool = null;
@@ -743,7 +735,7 @@ fn transformOptionsFromJSC(globalObject: JSC.C.JSContextRef, temp_allocator: std
 pub fn constructor(
     globalThis: *JSC.JSGlobalObject,
     callframe: *JSC.CallFrame,
-) callconv(.C) ?*Transpiler {
+) ?*Transpiler {
     var temp = bun.ArenaAllocator.init(getAllocator(globalThis));
     const arguments = callframe.arguments(3);
     var args = JSC.Node.ArgumentsSlice.init(
@@ -834,8 +826,9 @@ pub fn constructor(
     bundler.options.auto_import_jsx = transpiler_options.runtime.auto_import_jsx;
     bundler.options.inlining = transpiler_options.runtime.inlining;
     bundler.options.hot_module_reloading = transpiler_options.runtime.hot_module_reloading;
-    bundler.options.jsx.supports_fast_refresh = bundler.options.hot_module_reloading and
-        bundler.options.allow_runtime and transpiler_options.runtime.react_fast_refresh;
+    bundler.options.react_fast_refresh = bundler.options.hot_module_reloading and
+        bundler.options.allow_runtime and
+        transpiler_options.runtime.react_fast_refresh;
 
     const transpiler = allocator.create(Transpiler) catch unreachable;
     transpiler.* = Transpiler{
@@ -852,7 +845,7 @@ pub fn finalize(
     this: *Transpiler,
 ) callconv(.C) void {
     this.bundler.log.deinit();
-    this.scan_pass_result.named_imports.deinit();
+    this.scan_pass_result.named_imports.deinit(this.scan_pass_result.import_records.allocator);
     this.scan_pass_result.import_records.deinit();
     this.scan_pass_result.used_symbols.deinit();
     if (this.buffer_writer != null) {
@@ -888,26 +881,14 @@ fn getParseResult(this: *Transpiler, allocator: std.mem.Allocator, code: []const
         // .allocator = this.
     };
 
-    var parse_result = this.bundler.parse(parse_options, null);
-
-    // necessary because we don't run the linker
-    if (parse_result) |*res| {
-        for (res.ast.import_records.slice()) |*import| {
-            if (import.kind.isCommonJS()) {
-                import.do_commonjs_transform_in_printer = true;
-                import.module_id = @as(u32, @truncate(bun.hash(import.path.pretty)));
-            }
-        }
-    }
-
-    return parse_result;
+    return this.bundler.parse(parse_options, null);
 }
 
 pub fn scan(
     this: *Transpiler,
     globalThis: *JSC.JSGlobalObject,
     callframe: *JSC.CallFrame,
-) callconv(.C) JSC.JSValue {
+) JSC.JSValue {
     JSC.markBinding(@src());
     const arguments = callframe.arguments(3);
     var args = JSC.Node.ArgumentsSlice.init(globalThis.bunVM(), arguments.slice());
@@ -1005,7 +986,7 @@ pub fn transform(
     this: *Transpiler,
     globalThis: *JSC.JSGlobalObject,
     callframe: *JSC.CallFrame,
-) callconv(.C) JSC.JSValue {
+) JSC.JSValue {
     JSC.markBinding(@src());
     var exception_ref = [_]JSC.C.JSValueRef{null};
     const exception: JSC.C.ExceptionRef = &exception_ref;
@@ -1050,7 +1031,7 @@ pub fn transform(
         if (code == .buffer) {
             code_arg.unprotect();
         }
-        globalThis.throw("Out of memory", .{});
+        globalThis.throwOutOfMemory();
         return .zero;
     };
     task.schedule();
@@ -1061,7 +1042,7 @@ pub fn transformSync(
     this: *Transpiler,
     globalThis: *JSC.JSGlobalObject,
     callframe: *JSC.CallFrame,
-) callconv(.C) JSC.JSValue {
+) JSC.JSValue {
     JSC.markBinding(@src());
     var exception_value = [_]JSC.C.JSValueRef{null};
     const exception: JSC.C.ExceptionRef = &exception_value;
@@ -1191,7 +1172,7 @@ pub fn transformSync(
     var out = JSC.ZigString.init(buffer_writer.written);
     out.setOutputEncoding();
 
-    return out.toValueGC(globalThis);
+    return out.toJS(globalThis);
 }
 
 fn namedExportsToJS(global: *JSGlobalObject, named_exports: *JSAst.Ast.NamedExports) JSC.JSValue {
@@ -1234,8 +1215,8 @@ fn namedImportsToJS(
         if (record.is_internal) continue;
 
         array.ensureStillAlive();
-        const path = JSC.ZigString.init(record.path.text).toValueGC(global);
-        const kind = JSC.ZigString.init(record.kind.label()).toValueGC(global);
+        const path = JSC.ZigString.init(record.path.text).toJS(global);
+        const kind = JSC.ZigString.init(record.kind.label()).toJS(global);
         array.putIndex(global, @as(u32, @truncate(i)), JSC.JSValue.createObject2(global, path_label, kind_label, path, kind));
     }
 
@@ -1246,7 +1227,7 @@ pub fn scanImports(
     this: *Transpiler,
     globalThis: *JSC.JSGlobalObject,
     callframe: *JSC.CallFrame,
-) callconv(.C) JSC.JSValue {
+) JSC.JSValue {
     const arguments = callframe.arguments(2);
     var exception_val = [_]JSC.C.JSValueRef{null};
     const exception: JSC.C.ExceptionRef = &exception_val;

@@ -19,7 +19,7 @@ const Bin = @import("./bin.zig").Bin;
 const Environment = bun.Environment;
 const Aligner = @import("./install.zig").Aligner;
 const HTTPClient = bun.http;
-const json_parser = bun.JSON;
+const JSON = bun.JSON;
 const default_allocator = bun.default_allocator;
 const IdentityContext = @import("../identity_context.zig").IdentityContext;
 const ArrayIdentityContext = @import("../identity_context.zig").ArrayIdentityContext;
@@ -31,8 +31,212 @@ const VersionSlice = @import("./install.zig").VersionSlice;
 const ObjectPool = @import("../pool.zig").ObjectPool;
 const Api = @import("../api/schema.zig").Api;
 const DotEnv = @import("../env_loader.zig");
+const http = bun.http;
+const OOM = bun.OOM;
+const Global = bun.Global;
+const PublishCommand = bun.CLI.PublishCommand;
 
 const Npm = @This();
+
+const WhoamiError = OOM || error{
+    NeedAuth,
+    ProbablyInvalidAuth,
+};
+
+pub fn whoami(allocator: std.mem.Allocator, manager: *PackageManager) WhoamiError!string {
+    const registry = manager.options.scope;
+
+    if (registry.user.len > 0) {
+        const sep = strings.indexOfChar(registry.user, ':').?;
+        return registry.user[0..sep];
+    }
+
+    if (registry.url.username.len > 0) return registry.url.username;
+
+    if (registry.token.len == 0) {
+        return error.NeedAuth;
+    }
+
+    const auth_type = if (manager.options.publish_config.auth_type) |auth_type| @tagName(auth_type) else "web";
+    const ci_name = bun.detectCI();
+
+    var print_buf = std.ArrayList(u8).init(allocator);
+    defer print_buf.deinit();
+    var print_writer = print_buf.writer();
+
+    var headers: http.HeaderBuilder = .{};
+
+    {
+        headers.count("accept", "*/*");
+        headers.count("accept-encoding", "gzip,deflate");
+
+        try print_writer.print("Bearer {s}", .{registry.token});
+        headers.count("authorization", print_buf.items);
+        print_buf.clearRetainingCapacity();
+
+        // no otp needed, just use auth-type from options
+        headers.count("npm-auth-type", auth_type);
+        headers.count("npm-command", "whoami");
+
+        try print_writer.print("{s} {s} {s} workspaces/{}{s}{s}", .{
+            Global.user_agent,
+            Global.os_name,
+            Global.arch_name,
+            // TODO: figure out how npm determines workspaces=true
+            false,
+            if (ci_name != null) " ci/" else "",
+            ci_name orelse "",
+        });
+        headers.count("user-agent", print_buf.items);
+        print_buf.clearRetainingCapacity();
+
+        headers.count("Connection", "keep-alive");
+        headers.count("Host", registry.url.host);
+    }
+
+    try headers.allocate(allocator);
+
+    {
+        headers.append("accept", "*/*");
+        headers.append("accept-encoding", "gzip/deflate");
+
+        try print_writer.print("Bearer {s}", .{registry.token});
+        headers.append("authorization", print_buf.items);
+        print_buf.clearRetainingCapacity();
+
+        headers.append("npm-auth-type", auth_type);
+        headers.append("npm-command", "whoami");
+
+        try print_writer.print("{s} {s} {s} workspaces/{}{s}{s}", .{
+            Global.user_agent,
+            Global.os_name,
+            Global.arch_name,
+            false,
+            if (ci_name != null) " ci/" else "",
+            ci_name orelse "",
+        });
+        headers.append("user-agent", print_buf.items);
+        print_buf.clearRetainingCapacity();
+
+        headers.append("Connection", "keep-alive");
+        headers.append("Host", registry.url.host);
+    }
+
+    try print_writer.print("{s}/-/whoami", .{
+        strings.withoutTrailingSlash(registry.url.href),
+    });
+
+    var response_buf = try MutableString.init(allocator, 1024);
+
+    const url = URL.parse(print_buf.items);
+
+    var req = http.AsyncHTTP.initSync(
+        allocator,
+        .GET,
+        url,
+        headers.entries,
+        headers.content.ptr.?[0..headers.content.len],
+        &response_buf,
+        "",
+        null,
+        null,
+        .follow,
+    );
+
+    const res = req.sendSync() catch |err| {
+        switch (err) {
+            error.OutOfMemory => |oom| return oom,
+            else => {
+                Output.err(err, "whoami request failed to send", .{});
+                Global.crash();
+            },
+        }
+    };
+
+    if (res.status_code >= 400) {
+        const otp_response = false;
+        try responseError(
+            allocator,
+            &req,
+            &res,
+            null,
+            &response_buf,
+            otp_response,
+        );
+    }
+
+    if (res.headers.getIfOtherIsAbsent("npm-notice", "x-local-cache")) |notice| {
+        Output.printError("\n", .{});
+        Output.note("{s}", .{notice});
+        Output.flush();
+    }
+
+    var log = logger.Log.init(allocator);
+    const source = logger.Source.initPathString("???", response_buf.list.items);
+    const json = JSON.parseUTF8(&source, &log, allocator) catch |err| {
+        switch (err) {
+            error.OutOfMemory => |oom| return oom,
+            else => {
+                Output.err(err, "failed to parse '/-/whoami' response body as JSON", .{});
+                Global.crash();
+            },
+        }
+    };
+
+    const username, _ = try json.getString(allocator, "username") orelse {
+        // no username, invalid auth probably
+        return error.ProbablyInvalidAuth;
+    };
+    return username;
+}
+
+pub fn responseError(
+    allocator: std.mem.Allocator,
+    req: *const http.AsyncHTTP,
+    res: *const bun.picohttp.Response,
+    // `<name>@<version>`
+    pkg_id: ?struct { string, string },
+    response_body: *MutableString,
+    comptime otp_response: bool,
+) OOM!noreturn {
+    const message = message: {
+        var log = logger.Log.init(allocator);
+        const source = logger.Source.initPathString("???", response_body.list.items);
+        const json = JSON.parseUTF8(&source, &log, allocator) catch |err| {
+            switch (err) {
+                error.OutOfMemory => |oom| return oom,
+                else => break :message null,
+            }
+        };
+
+        const @"error", _ = try json.getString(allocator, "error") orelse break :message null;
+        break :message @"error";
+    };
+
+    Output.prettyErrorln("\n<red>{d}<r>{s}{s}: {s}\n", .{
+        res.status_code,
+        if (res.status.len > 0) " " else "",
+        res.status,
+        bun.fmt.redactedNpmUrl(req.url.href),
+    });
+
+    if (res.status_code == 404 and pkg_id != null) {
+        const package_name, const package_version = pkg_id.?;
+        Output.prettyErrorln("\n - '{s}@{s}' does not exist in this registry", .{ package_name, package_version });
+    } else {
+        if (message) |msg| {
+            if (comptime otp_response) {
+                if (res.status_code == 401 and strings.containsComptime(msg, "You must provide a one-time pass. Upgrade your client to npm@latest in order to use 2FA.")) {
+                    Output.prettyErrorln("\n - Received invalid OTP", .{});
+                    Global.crash();
+                }
+            }
+            Output.prettyErrorln("\n - {s}", .{msg});
+        }
+    }
+
+    Global.crash();
+}
 
 pub const Registry = struct {
     pub const default_url = "https://registry.npmjs.org/";
@@ -52,6 +256,9 @@ pub const Registry = struct {
         url: URL,
         url_hash: u64,
         token: string = "",
+
+        // username and password combo, `user:pass`
+        user: string = "",
 
         pub fn hash(str: string) u64 {
             return String.Builder.stringHash(str);
@@ -82,6 +289,7 @@ pub const Registry = struct {
 
             var url = URL.parse(registry.url);
             var auth: string = "";
+            var user: []u8 = "";
             var needs_normalize = false;
 
             if (registry.token.len == 0) {
@@ -176,12 +384,12 @@ pub const Registry = struct {
 
                     if (registry.username.len > 0 and registry.password.len > 0 and auth.len == 0) {
                         var output_buf = try allocator.alloc(u8, registry.username.len + registry.password.len + 1 + std.base64.standard.Encoder.calcSize(registry.username.len + registry.password.len + 1));
-                        var input_buf = output_buf[0 .. registry.username.len + registry.password.len + 1];
-                        @memcpy(input_buf[0..registry.username.len], registry.username);
-                        input_buf[registry.username.len] = ':';
-                        @memcpy(input_buf[registry.username.len + 1 ..][0..registry.password.len], registry.password);
-                        output_buf = output_buf[input_buf.len..];
-                        auth = std.base64.standard.Encoder.encode(output_buf, input_buf);
+                        user = output_buf[0 .. registry.username.len + registry.password.len + 1];
+                        @memcpy(user[0..registry.username.len], registry.username);
+                        user[registry.username.len] = ':';
+                        @memcpy(user[registry.username.len + 1 ..][0..registry.password.len], registry.password);
+                        output_buf = output_buf[user.len..];
+                        auth = std.base64.standard.Encoder.encode(output_buf, user);
                         break :outer;
                     }
                 }
@@ -207,6 +415,7 @@ pub const Registry = struct {
                 .url_hash = url_hash,
                 .token = registry.token,
                 .auth = auth,
+                .user = user,
             };
         }
     };
@@ -249,7 +458,7 @@ pub const Registry = struct {
 
         var newly_last_modified: string = "";
         var new_etag: string = "";
-        for (response.headers) |header| {
+        for (response.headers.list) |header| {
             if (!(header.name.len == "last-modified".len or header.name.len == "etag".len)) continue;
 
             const hashed = HTTPClient.hashHeaderName(header.name);
@@ -274,6 +483,7 @@ pub const Registry = struct {
 
         if (try PackageManifest.parse(
             allocator,
+            scope,
             log,
             body,
             package_name,
@@ -319,6 +529,72 @@ const ExternVersionMap = extern struct {
     }
 };
 
+fn Negatable(comptime T: type) type {
+    return struct {
+        added: T = T.none,
+        removed: T = T.none,
+        had_wildcard: bool = false,
+        had_unrecognized_values: bool = false,
+
+        // https://github.com/pnpm/pnpm/blob/1f228b0aeec2ef9a2c8577df1d17186ac83790f9/config/package-is-installable/src/checkPlatform.ts#L56-L86
+        // https://github.com/npm/cli/blob/fefd509992a05c2dfddbe7bc46931c42f1da69d7/node_modules/npm-install-checks/lib/index.js#L2-L96
+        pub fn combine(this: Negatable(T)) T {
+            const added = if (this.had_wildcard) T.all_value else @intFromEnum(this.added);
+            const removed = @intFromEnum(this.removed);
+
+            // If none were added or removed, all are allowed
+            if (added == 0 and removed == 0) {
+                if (this.had_unrecognized_values) {
+                    return T.none;
+                }
+
+                // []
+                return T.all;
+            }
+
+            // If none were added, but some were removed, return the inverse of the removed
+            if (added == 0 and removed != 0) {
+                // ["!linux", "!darwin"]
+                return @enumFromInt(T.all_value & ~removed);
+            }
+
+            if (removed == 0) {
+                // ["linux", "darwin"]
+                return @enumFromInt(added);
+            }
+
+            // - ["linux", "!darwin"]
+            return @enumFromInt(added & ~removed);
+        }
+
+        pub fn apply(this: *Negatable(T), str: []const u8) void {
+            if (str.len == 0) {
+                return;
+            }
+
+            if (strings.eqlComptime(str, "any")) {
+                this.had_wildcard = true;
+                return;
+            }
+
+            const is_not = str[0] == '!';
+            const offset: usize = @intFromBool(is_not);
+
+            const field: u16 = T.NameMap.get(str[offset..]) orelse {
+                if (!is_not)
+                    this.had_unrecognized_values = true;
+                return;
+            };
+
+            if (is_not) {
+                this.* = .{ .added = this.added, .removed = @enumFromInt(@intFromEnum(this.removed) | field) };
+            } else {
+                this.* = .{ .added = @enumFromInt(@intFromEnum(this.added) | field), .removed = this.removed };
+            }
+        }
+    };
+}
+
 /// https://nodejs.org/api/os.html#osplatform
 pub const OperatingSystem = enum(u16) {
     none = 0,
@@ -337,16 +613,15 @@ pub const OperatingSystem = enum(u16) {
 
     pub const all_value: u16 = aix | darwin | freebsd | linux | openbsd | sunos | win32 | android;
 
+    pub const current: OperatingSystem = switch (Environment.os) {
+        .linux => @enumFromInt(linux),
+        .mac => @enumFromInt(darwin),
+        .windows => @enumFromInt(win32),
+        else => @compileError("Unsupported operating system: " ++ @tagName(Environment.os)),
+    };
+
     pub fn isMatch(this: OperatingSystem) bool {
-        if (comptime Environment.isLinux) {
-            return (@intFromEnum(this) & linux) != 0;
-        } else if (comptime Environment.isMac) {
-            return (@intFromEnum(this) & darwin) != 0;
-        } else if (comptime Environment.isWindows) {
-            return (@intFromEnum(this) & win32) != 0;
-        } else {
-            return false;
-        }
+        return (@intFromEnum(this) & @intFromEnum(current)) != 0;
     }
 
     pub inline fn has(this: OperatingSystem, other: u16) bool {
@@ -364,31 +639,42 @@ pub const OperatingSystem = enum(u16) {
         .{ "android", android },
     });
 
-    pub fn apply(this_: OperatingSystem, str: []const u8) OperatingSystem {
-        if (str.len == 0) {
-            return this_;
+    pub const current_name = switch (Environment.os) {
+        .linux => "linux",
+        .mac => "darwin",
+        .windows => "win32",
+        else => @compileError("Unsupported operating system: " ++ @tagName(current)),
+    };
+
+    pub fn negatable(this: OperatingSystem) Negatable(OperatingSystem) {
+        return .{ .added = this, .removed = .none };
+    }
+
+    const JSC = bun.JSC;
+    pub fn jsFunctionOperatingSystemIsMatch(globalObject: *JSC.JSGlobalObject, callframe: *JSC.CallFrame) callconv(JSC.conv) JSC.JSValue {
+        const args = callframe.arguments(1);
+        var operating_system = negatable(.none);
+        var iter = args.ptr[0].arrayIterator(globalObject);
+        while (iter.next()) |item| {
+            const slice = item.toSlice(globalObject, bun.default_allocator);
+            defer slice.deinit();
+            operating_system.apply(slice.slice());
+            if (globalObject.hasException()) return .zero;
         }
-        const this = @intFromEnum(this_);
-
-        const is_not = str[0] == '!';
-        const offset: usize = if (str[0] == '!') 1 else 0;
-
-        const field: u16 = NameMap.get(str[offset..]) orelse return this_;
-
-        if (is_not) {
-            return @as(OperatingSystem, @enumFromInt(this & ~field));
-        } else {
-            return @as(OperatingSystem, @enumFromInt(this | field));
-        }
+        if (globalObject.hasException()) return .zero;
+        return JSC.JSValue.jsBoolean(operating_system.combine().isMatch());
     }
 };
 
 pub const Libc = enum(u8) {
     none = 0,
+    all = all_value,
     _,
 
     pub const glibc: u8 = 1 << 1;
     pub const musl: u8 = 1 << 2;
+
+    pub const all_value: u8 = glibc | musl;
 
     pub const NameMap = bun.ComptimeStringMap(u8, .{
         .{ "glibc", glibc },
@@ -399,22 +685,26 @@ pub const Libc = enum(u8) {
         return (@intFromEnum(this) & other) != 0;
     }
 
-    pub fn apply(this_: Libc, str: []const u8) Libc {
-        if (str.len == 0) {
-            return this_;
+    pub fn negatable(this: Libc) Negatable(Libc) {
+        return .{ .added = this, .removed = .none };
+    }
+
+    // TODO:
+    pub const current: Libc = @intFromEnum(glibc);
+
+    const JSC = bun.JSC;
+    pub fn jsFunctionLibcIsMatch(globalObject: *JSC.JSGlobalObject, callframe: *JSC.CallFrame) callconv(JSC.conv) JSC.JSValue {
+        const args = callframe.arguments(1);
+        var libc = negatable(.none);
+        var iter = args.ptr[0].arrayIterator(globalObject);
+        while (iter.next()) |item| {
+            const slice = item.toSlice(globalObject, bun.default_allocator);
+            defer slice.deinit();
+            libc.apply(slice.slice());
+            if (globalObject.hasException()) return .zero;
         }
-        const this = @intFromEnum(this_);
-
-        const is_not = str[0] == '!';
-        const offset: usize = if (str[0] == '!') 1 else 0;
-
-        const field: u8 = NameMap.get(str[offset..]) orelse return this_;
-
-        if (is_not) {
-            return @as(Libc, @enumFromInt(this & ~field));
-        } else {
-            return @as(Libc, @enumFromInt(this | field));
-        }
+        if (globalObject.hasException()) return .zero;
+        return JSC.JSValue.jsBoolean(libc.combine().isMatch());
     }
 };
 
@@ -439,6 +729,18 @@ pub const Architecture = enum(u16) {
 
     pub const all_value: u16 = arm | arm64 | ia32 | mips | mipsel | ppc | ppc64 | s390 | s390x | x32 | x64;
 
+    pub const current: Architecture = switch (Environment.arch) {
+        .arm64 => @enumFromInt(arm64),
+        .x64 => @enumFromInt(x64),
+        else => @compileError("Specify architecture: " ++ Environment.arch),
+    };
+
+    pub const current_name = switch (Environment.arch) {
+        .arm64 => "arm64",
+        .x64 => "x64",
+        else => @compileError("Unsupported architecture: " ++ @tagName(current)),
+    };
+
     pub const NameMap = bun.ComptimeStringMap(u16, .{
         .{ "arm", arm },
         .{ "arm64", arm64 },
@@ -458,34 +760,29 @@ pub const Architecture = enum(u16) {
     }
 
     pub fn isMatch(this: Architecture) bool {
-        if (comptime Environment.isAarch64) {
-            return (@intFromEnum(this) & arm64) != 0;
-        } else if (comptime Environment.isX64) {
-            return (@intFromEnum(this) & x64) != 0;
-        } else {
-            return false;
-        }
+        return @intFromEnum(this) & @intFromEnum(current) != 0;
     }
 
-    pub fn apply(this_: Architecture, str: []const u8) Architecture {
-        if (str.len == 0) {
-            return this_;
+    pub fn negatable(this: Architecture) Negatable(Architecture) {
+        return .{ .added = this, .removed = .none };
+    }
+
+    const JSC = bun.JSC;
+    pub fn jsFunctionArchitectureIsMatch(globalObject: *JSC.JSGlobalObject, callframe: *JSC.CallFrame) callconv(JSC.conv) JSC.JSValue {
+        const args = callframe.arguments(1);
+        var architecture = negatable(.none);
+        var iter = args.ptr[0].arrayIterator(globalObject);
+        while (iter.next()) |item| {
+            const slice = item.toSlice(globalObject, bun.default_allocator);
+            defer slice.deinit();
+            architecture.apply(slice.slice());
+            if (globalObject.hasException()) return .zero;
         }
-        const this = @intFromEnum(this_);
-
-        const is_not = str[0] == '!';
-        const offset: usize = if (str[0] == '!') 1 else 0;
-        const input = str[offset..];
-
-        const field: u16 = NameMap.get(input) orelse return this_;
-
-        if (is_not) {
-            return @as(Architecture, @enumFromInt(this & ~field));
-        } else {
-            return @as(Architecture, @enumFromInt(this | field));
-        }
+        if (globalObject.hasException()) return .zero;
+        return JSC.JSValue.jsBoolean(architecture.combine().isMatch());
     }
 };
+
 const BigExternalString = Semver.BigExternalString;
 
 pub const PackageVersion = extern struct {
@@ -591,7 +888,8 @@ pub const PackageManifest = struct {
 
     pub const Serializer = struct {
         // - version 3: added serialization of registry url. it's used to invalidate when it changes
-        pub const version = "bun-npm-manifest-cache-v0.0.3\n";
+        // - version 4: fixed bug with cpu & os tag not being added correctly
+        pub const version = "bun-npm-manifest-cache-v0.0.4\n";
         const header_bytes: string = "#!/usr/bin/env bun\n" ++ version;
 
         pub const sizes = blk: {
@@ -607,8 +905,8 @@ pub const PackageManifest = struct {
                 alignment: usize,
             };
             var data: [fields.len]Data = undefined;
-            for (fields, 0..) |field_info, i| {
-                data[i] = .{
+            for (fields, &data) |field_info, *dat| {
+                dat.* = .{
                     .size = @sizeOf(field_info.type),
                     .name = field_info.name,
                     .alignment = if (@sizeOf(field_info.type) == 0) 1 else field_info.alignment,
@@ -622,9 +920,9 @@ pub const PackageManifest = struct {
             std.sort.pdq(Data, &data, {}, Sort.lessThan);
             var sizes_bytes: [fields.len]usize = undefined;
             var names: [fields.len][]const u8 = undefined;
-            for (data, 0..) |elem, i| {
-                sizes_bytes[i] = elem.size;
-                names[i] = elem.name;
+            for (data, &sizes_bytes, &names) |elem, *size_, *name_| {
+                size_.* = elem.size;
+                name_.* = elem.name;
             }
             break :blk .{
                 .bytes = sizes_bytes,
@@ -658,7 +956,11 @@ pub const PackageManifest = struct {
             }
 
             stream.pos += Aligner.skipAmount(Type, stream.pos);
-            const result_bytes = stream.buffer[stream.pos..][0..byte_len];
+            const remaining = stream.buffer[@min(stream.pos, stream.buffer.len)..];
+            if (remaining.len < byte_len) {
+                return error.BufferTooSmall;
+            }
+            const result_bytes = remaining[0..byte_len];
             const result = @as([*]const Type, @ptrCast(@alignCast(result_bytes.ptr)))[0 .. result_bytes.len / @sizeOf(Type)];
             stream.pos += result_bytes.len;
             return result;
@@ -904,10 +1206,14 @@ pub const PackageManifest = struct {
                 .{ .mode = .read_only },
             ) catch return null;
             defer cache_file.close();
-            const bytes = try cache_file.readToEndAllocOptions(
+            return loadByFile(allocator, scope, cache_file);
+        }
+
+        pub fn loadByFile(allocator: std.mem.Allocator, scope: *const Registry.Scope, manifest_file: std.fs.File) !?PackageManifest {
+            const bytes = try manifest_file.readToEndAllocOptions(
                 allocator,
                 std.math.maxInt(u32),
-                cache_file.getEndPos() catch null,
+                manifest_file.getEndPos() catch null,
                 @alignOf(u8),
                 null,
             );
@@ -952,6 +1258,96 @@ pub const PackageManifest = struct {
             }
 
             return package_manifest;
+        }
+    };
+
+    pub const bindings = struct {
+        const JSC = bun.JSC;
+        const JSValue = JSC.JSValue;
+        const JSGlobalObject = JSC.JSGlobalObject;
+        const CallFrame = JSC.CallFrame;
+        const ZigString = JSC.ZigString;
+
+        pub fn generate(global: *JSGlobalObject) JSValue {
+            const obj = JSValue.createEmptyObject(global, 1);
+            const parseManifestString = ZigString.static("parseManifest");
+            obj.put(global, parseManifestString, JSC.createCallback(global, parseManifestString, 2, jsParseManifest));
+            return obj;
+        }
+
+        pub fn jsParseManifest(global: *JSGlobalObject, callFrame: *CallFrame) JSValue {
+            const args = callFrame.arguments(2).slice();
+            if (args.len < 2 or !args[0].isString() or !args[1].isString()) {
+                global.throw("expected manifest filename and registry string arguments", .{});
+                return .zero;
+            }
+
+            const manifest_filename_str = args[0].toBunString(global);
+            defer manifest_filename_str.deref();
+
+            const manifest_filename = manifest_filename_str.toUTF8(bun.default_allocator);
+            defer manifest_filename.deinit();
+
+            const registry_str = args[1].toBunString(global);
+            defer registry_str.deref();
+
+            const registry = registry_str.toUTF8(bun.default_allocator);
+            defer registry.deinit();
+
+            const manifest_file = std.fs.openFileAbsolute(manifest_filename.slice(), .{}) catch |err| {
+                global.throw("failed to open manifest file \"{s}\": {s}", .{ manifest_filename.slice(), @errorName(err) });
+                return .zero;
+            };
+            defer manifest_file.close();
+
+            const scope: Registry.Scope = .{
+                .url_hash = Registry.Scope.hash(strings.withoutTrailingSlash(registry.slice())),
+                .url = .{
+                    .host = strings.withoutTrailingSlash(strings.withoutPrefixComptime(registry.slice(), "http://")),
+                    .hostname = strings.withoutTrailingSlash(strings.withoutPrefixComptime(registry.slice(), "http://")),
+                    .href = registry.slice(),
+                    .origin = strings.withoutTrailingSlash(registry.slice()),
+                    .protocol = if (strings.indexOfChar(registry.slice(), ':')) |colon| registry.slice()[0..colon] else "",
+                },
+            };
+
+            const maybe_package_manifest = Serializer.loadByFile(bun.default_allocator, &scope, manifest_file) catch |err| {
+                global.throw("failed to load manifest file: {s}", .{@errorName(err)});
+                return .zero;
+            };
+
+            const package_manifest: PackageManifest = maybe_package_manifest orelse {
+                global.throw("manifest is invalid ", .{});
+                return .zero;
+            };
+
+            var buf: std.ArrayListUnmanaged(u8) = .{};
+            const writer = buf.writer(bun.default_allocator);
+
+            // TODO: we can add more information. for now just versions is fine
+
+            writer.print("{{\"name\":\"{s}\",\"versions\":[", .{package_manifest.name()}) catch {
+                global.throwOutOfMemory();
+                return .zero;
+            };
+
+            for (package_manifest.versions, 0..) |version, i| {
+                if (i == package_manifest.versions.len - 1)
+                    writer.print("\"{}\"]}}", .{version.fmt(package_manifest.string_buf)}) catch {
+                        global.throwOutOfMemory();
+                        return .zero;
+                    }
+                else
+                    writer.print("\"{}\",", .{version.fmt(package_manifest.string_buf)}) catch {
+                        global.throwOutOfMemory();
+                        return .zero;
+                    };
+            }
+
+            var result = bun.String.fromUTF8(buf.items);
+            defer result.deref();
+
+            return result.toJSByParseJSON(global);
         }
     };
 
@@ -1078,8 +1474,9 @@ pub const PackageManifest = struct {
     const ExternalStringMapDeduper = std.HashMap(u64, ExternalStringList, IdentityContext(u64), 80);
 
     /// This parses [Abbreviated metadata](https://github.com/npm/registry/blob/master/docs/responses/package-metadata.md#abbreviated-metadata-format)
-    pub fn parse(
+    fn parse(
         allocator: std.mem.Allocator,
+        scope: *const Registry.Scope,
         log: *logger.Log,
         json_buffer: []const u8,
         expected_name: []const u8,
@@ -1092,7 +1489,7 @@ pub const PackageManifest = struct {
         defer bun.JSAst.Stmt.Data.Store.memory_allocator.?.pop();
         var arena = bun.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const json = json_parser.ParseJSONUTF8(
+        const json = JSON.parseUTF8(
             &source,
             log,
             arena.allocator(),
@@ -1120,68 +1517,19 @@ pub const PackageManifest = struct {
             .string_pool = string_pool,
         };
 
-        if (json.asProperty("name")) |name_q| {
-            const received_name = name_q.expr.asString(allocator) orelse return null;
-
-            // This is intentionally a case insensitive comparision. If the registry is running on a system
-            // with a case insensitive filesystem, you'll be able to install dependencies with casing that doesn't match.
-            //
-            // e.g.
-            // {
-            //   "dependencies": {
-            //     // will install successfully, even though the package name in the registry is `jquery`
-            //     "jQuery": "3.7.1"
-            //   }
-            // }
-            //
-            // https://github.com/oven-sh/bun/issues/5189
-            const equal = if (expected_name.len == 0 or expected_name[0] != '@')
-                // Unscoped package, just normal case insensitive comparison
-                strings.eqlCaseInsensitiveASCII(expected_name, received_name, true)
-            else brk: {
-                // Scoped package. The registry might url encode the package name changing either or both `@` and `/` into `%40` and `%2F`.
-                // e.g. "name": "@std%2fsemver" // real world example from crash report
-
-                // Expected name `@` exists, check received has either `@` or `%40`
-                var received_remain = received_name;
-                if (received_remain.len > 0 and received_remain[0] == '@') {
-                    received_remain = received_remain[1..];
-                } else if (received_remain.len > 2 and strings.eqlComptime(received_remain[0..3], "%40")) {
-                    received_remain = received_remain[3..];
-                } else {
-                    break :brk false;
+        if (PackageManager.verbose_install) {
+            if (json.asProperty("name")) |name_q| {
+                const received_name = name_q.expr.asString(allocator) orelse return null;
+                // If this manifest is coming from the default registry, make sure it's the expected one. If it's not
+                // from the default registry we don't check because the registry might have a different name in the manifest.
+                // https://github.com/oven-sh/bun/issues/4925
+                if (scope.url_hash == Registry.default_url_hash and !strings.eqlLong(expected_name, received_name, true)) {
+                    Output.warn("Package name mismatch. Expected <b>\"{s}\"<r> but received <red>\"{s}\"<r>", .{ expected_name, received_name });
                 }
-
-                var expected_remain = expected_name[1..];
-
-                // orelse is invalid because scoped package is missing `/`, but we allow just in case
-                const slash_index = strings.indexOfChar(expected_remain, '/') orelse break :brk strings.eqlCaseInsensitiveASCII(expected_remain, received_remain, true);
-
-                if (slash_index >= received_remain.len) break :brk false;
-
-                if (!strings.eqlCaseInsensitiveASCIIIgnoreLength(expected_remain[0..slash_index], received_remain[0..slash_index])) break :brk false;
-                expected_remain = expected_remain[slash_index + 1 ..];
-
-                // Expected name `/` exists, check that received is either `/`, `%2f`, or `%2F`
-                received_remain = received_remain[slash_index..];
-                if (received_remain.len > 0 and received_remain[0] == '/') {
-                    received_remain = received_remain[1..];
-                } else if (received_remain.len > 2 and strings.eqlCaseInsensitiveASCIIIgnoreLength(received_remain[0..3], "%2f")) {
-                    received_remain = received_remain[3..];
-                } else {
-                    break :brk false;
-                }
-
-                break :brk strings.eqlCaseInsensitiveASCII(expected_remain, received_remain, true);
-            };
-
-            if (!equal) {
-                Output.panic("<r>internal: <red>Package name mismatch.<r> Expected <b>\"{s}\"<r> but received <red>\"{s}\"<r>", .{ expected_name, received_name });
-                return null;
             }
-
-            string_builder.count(expected_name);
         }
+
+        string_builder.count(expected_name);
 
         if (json.asProperty("modified")) |name_q| {
             const field = name_q.expr.asString(allocator) orelse return null;
@@ -1212,7 +1560,7 @@ pub const PackageManifest = struct {
                     const sliced_version = SlicedString.init(version_name, version_name);
                     const parsed_version = Semver.Version.parse(sliced_version);
 
-                    if (Environment.allow_assert) assert(parsed_version.valid);
+                    if (Environment.allow_assert) bun.assertWithLocation(parsed_version.valid, @src());
                     if (!parsed_version.valid) {
                         log.addErrorFmt(&source, prop.value.?.loc, allocator, "Failed to parse dependency {s}", .{version_name}) catch unreachable;
                         continue;
@@ -1374,9 +1722,8 @@ pub const PackageManifest = struct {
             string_buf = ptr[0..string_builder.cap];
         }
 
-        // Using `expected_name` instead of the name from the manifest. We've already
-        // checked that they are equal above, but `expected_name` will not have `@`
-        // or `/` changed to `%40` or `%2f`, ensuring lookups will work later
+        // Using `expected_name` instead of the name from the manifest. Custom registries might
+        // have a different name than the dependency name in package.json.
         result.pkg.name = string_builder.append(ExternalString, expected_name);
 
         get_versions: {
@@ -1401,85 +1748,85 @@ pub const PackageManifest = struct {
                     var sliced_version = SlicedString.init(version_name, version_name);
                     var parsed_version = Semver.Version.parse(sliced_version);
 
-                    if (Environment.allow_assert) assert(parsed_version.valid);
+                    if (Environment.allow_assert) bun.assertWithLocation(parsed_version.valid, @src());
                     // We only need to copy the version tags if it contains pre and/or build
                     if (parsed_version.version.tag.hasBuild() or parsed_version.version.tag.hasPre()) {
                         const version_string = string_builder.append(String, version_name);
                         sliced_version = version_string.sliced(string_buf);
                         parsed_version = Semver.Version.parse(sliced_version);
                         if (Environment.allow_assert) {
-                            assert(parsed_version.valid);
-                            assert(parsed_version.version.tag.hasBuild() or parsed_version.version.tag.hasPre());
+                            bun.assertWithLocation(parsed_version.valid, @src());
+                            bun.assertWithLocation(parsed_version.version.tag.hasBuild() or parsed_version.version.tag.hasPre(), @src());
                         }
                     }
                     if (!parsed_version.valid) continue;
 
                     var package_version: PackageVersion = empty_version;
 
-                    if (prop.value.?.asProperty("cpu")) |cpu| {
-                        package_version.cpu = Architecture.all;
+                    if (prop.value.?.asProperty("cpu")) |cpu_q| {
+                        var cpu = Architecture.none.negatable();
 
-                        switch (cpu.expr.data) {
+                        switch (cpu_q.expr.data) {
                             .e_array => |arr| {
                                 const items = arr.slice();
                                 if (items.len > 0) {
-                                    package_version.cpu = Architecture.none;
                                     for (items) |item| {
                                         if (item.asString(allocator)) |cpu_str_| {
-                                            package_version.cpu = package_version.cpu.apply(cpu_str_);
+                                            cpu.apply(cpu_str_);
                                         }
                                     }
                                 }
                             },
                             .e_string => |stri| {
-                                package_version.cpu = Architecture.apply(Architecture.none, stri.data);
+                                cpu.apply(stri.data);
                             },
                             else => {},
                         }
+                        package_version.cpu = cpu.combine();
                     }
 
-                    if (prop.value.?.asProperty("os")) |os| {
-                        package_version.os = OperatingSystem.all;
+                    if (prop.value.?.asProperty("os")) |os_q| {
+                        var os = OperatingSystem.none.negatable();
 
-                        switch (os.expr.data) {
+                        switch (os_q.expr.data) {
                             .e_array => |arr| {
                                 const items = arr.slice();
                                 if (items.len > 0) {
-                                    package_version.os = OperatingSystem.none;
                                     for (items) |item| {
                                         if (item.asString(allocator)) |cpu_str_| {
-                                            package_version.os = package_version.os.apply(cpu_str_);
+                                            os.apply(cpu_str_);
                                         }
                                     }
                                 }
                             },
                             .e_string => |stri| {
-                                package_version.os = OperatingSystem.apply(OperatingSystem.none, stri.data);
+                                os.apply(stri.data);
                             },
                             else => {},
                         }
+                        package_version.os = os.combine();
                     }
 
                     if (prop.value.?.asProperty("libc")) |libc| {
-                        package_version.libc = Libc.none;
+                        var libc_ = Libc.none.negatable();
 
                         switch (libc.expr.data) {
                             .e_array => |arr| {
                                 const items = arr.slice();
                                 if (items.len > 0) {
-                                    package_version.libc = Libc.none;
                                     for (items) |item| {
                                         if (item.asString(allocator)) |libc_str_| {
-                                            package_version.libc = package_version.libc.apply(libc_str_);
+                                            libc_.apply(libc_str_);
                                         }
                                     }
                                 }
                             },
                             .e_string => |stri| {
-                                package_version.libc = Libc.apply(.none, stri.data);
+                                libc_.apply(stri.data);
                             },
                             else => {},
                         }
+                        package_version.libc = libc_.combine();
                     }
 
                     if (prop.value.?.asProperty("hasInstallScript")) |has_install_script| {
@@ -1774,13 +2121,13 @@ pub const PackageManifest = struct {
                                 if (comptime Environment.allow_assert) {
                                     const dependencies_list = @field(package_version, pair.field);
 
-                                    assert(dependencies_list.name.off < all_extern_strings.len);
-                                    assert(dependencies_list.value.off < all_extern_strings.len);
-                                    assert(dependencies_list.name.off + dependencies_list.name.len < all_extern_strings.len);
-                                    assert(dependencies_list.value.off + dependencies_list.value.len < all_extern_strings.len);
+                                    bun.assertWithLocation(dependencies_list.name.off < all_extern_strings.len, @src());
+                                    bun.assertWithLocation(dependencies_list.value.off < all_extern_strings.len, @src());
+                                    bun.assertWithLocation(dependencies_list.name.off + dependencies_list.name.len < all_extern_strings.len, @src());
+                                    bun.assertWithLocation(dependencies_list.value.off + dependencies_list.value.len < all_extern_strings.len, @src());
 
-                                    assert(std.meta.eql(dependencies_list.name.get(all_extern_strings), this_names));
-                                    assert(std.meta.eql(dependencies_list.value.get(version_extern_strings), this_versions));
+                                    bun.assertWithLocation(std.meta.eql(dependencies_list.name.get(all_extern_strings), this_names), @src());
+                                    bun.assertWithLocation(std.meta.eql(dependencies_list.value.get(version_extern_strings), this_versions), @src());
                                     var j: usize = 0;
                                     const name_dependencies = dependencies_list.name.get(all_extern_strings);
 
@@ -1788,31 +2135,31 @@ pub const PackageManifest = struct {
                                         if (optional_peer_dep_names.items.len == 0) {
                                             while (j < name_dependencies.len) : (j += 1) {
                                                 const dep_name = name_dependencies[j];
-                                                assert(std.mem.eql(u8, dep_name.slice(string_buf), this_names[j].slice(string_buf)));
-                                                assert(std.mem.eql(u8, dep_name.slice(string_buf), items[j].key.?.asString(allocator).?));
+                                                bun.assertWithLocation(std.mem.eql(u8, dep_name.slice(string_buf), this_names[j].slice(string_buf)), @src());
+                                                bun.assertWithLocation(std.mem.eql(u8, dep_name.slice(string_buf), items[j].key.?.asString(allocator).?), @src());
                                             }
 
                                             j = 0;
                                             while (j < dependencies_list.value.len) : (j += 1) {
                                                 const dep_name = dependencies_list.value.get(version_extern_strings)[j];
 
-                                                assert(std.mem.eql(u8, dep_name.slice(string_buf), this_versions[j].slice(string_buf)));
-                                                assert(std.mem.eql(u8, dep_name.slice(string_buf), items[j].value.?.asString(allocator).?));
+                                                bun.assertWithLocation(std.mem.eql(u8, dep_name.slice(string_buf), this_versions[j].slice(string_buf)), @src());
+                                                bun.assertWithLocation(std.mem.eql(u8, dep_name.slice(string_buf), items[j].value.?.asString(allocator).?), @src());
                                             }
                                         }
                                     } else {
                                         while (j < name_dependencies.len) : (j += 1) {
                                             const dep_name = name_dependencies[j];
-                                            assert(std.mem.eql(u8, dep_name.slice(string_buf), this_names[j].slice(string_buf)));
-                                            assert(std.mem.eql(u8, dep_name.slice(string_buf), items[j].key.?.asString(allocator).?));
+                                            bun.assertWithLocation(std.mem.eql(u8, dep_name.slice(string_buf), this_names[j].slice(string_buf)), @src());
+                                            bun.assertWithLocation(std.mem.eql(u8, dep_name.slice(string_buf), items[j].key.?.asString(allocator).?), @src());
                                         }
 
                                         j = 0;
                                         while (j < dependencies_list.value.len) : (j += 1) {
                                             const dep_name = dependencies_list.value.get(version_extern_strings)[j];
 
-                                            assert(std.mem.eql(u8, dep_name.slice(string_buf), this_versions[j].slice(string_buf)));
-                                            assert(std.mem.eql(u8, dep_name.slice(string_buf), items[j].value.?.asString(allocator).?));
+                                            bun.assertWithLocation(std.mem.eql(u8, dep_name.slice(string_buf), this_versions[j].slice(string_buf)), @src());
+                                            bun.assertWithLocation(std.mem.eql(u8, dep_name.slice(string_buf), items[j].value.?.asString(allocator).?), @src());
                                         }
                                     }
                                 }
@@ -1865,8 +2212,8 @@ pub const PackageManifest = struct {
                 };
 
                 if (comptime Environment.allow_assert) {
-                    assert(std.meta.eql(result.pkg.dist_tags.versions.get(all_semver_versions), dist_tag_versions[0..dist_tag_i]));
-                    assert(std.meta.eql(result.pkg.dist_tags.tags.get(all_extern_strings), extern_strings_slice[0..dist_tag_i]));
+                    bun.assertWithLocation(std.meta.eql(result.pkg.dist_tags.versions.get(all_semver_versions), dist_tag_versions[0..dist_tag_i]), @src());
+                    bun.assertWithLocation(std.meta.eql(result.pkg.dist_tags.tags.get(all_extern_strings), extern_strings_slice[0..dist_tag_i]), @src());
                 }
 
                 extern_strings = extern_strings[dist_tag_i..];
@@ -1975,13 +2322,13 @@ pub const PackageManifest = struct {
                             const first = semver_versions_[0];
                             const second = semver_versions_[1];
                             const order = second.order(first, string_buf, string_buf);
-                            assert(order == .gt);
+                            bun.assertWithLocation(order == .gt, @src());
                         }
                     }
                 }
             },
             else => {
-                assert(max_versions_count == 0);
+                bun.assertWithLocation(max_versions_count == 0, @src());
             },
         }
 
@@ -1989,7 +2336,7 @@ pub const PackageManifest = struct {
             const src = std.mem.sliceAsBytes(all_tarball_url_strings[0 .. all_tarball_url_strings.len - tarball_url_strings.len]);
             if (src.len > 0) {
                 var dst = std.mem.sliceAsBytes(all_extern_strings[all_extern_strings.len - extern_strings.len ..]);
-                assert(dst.len >= src.len);
+                bun.assertWithLocation(dst.len >= src.len, @src());
                 @memcpy(dst[0..src.len], src);
             }
 

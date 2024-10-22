@@ -176,7 +176,7 @@ pub const struct_bn_mont_ctx_st = extern struct {
 };
 pub const BN_MONT_CTX = struct_bn_mont_ctx_st;
 pub const struct_bn_blinding_st = opaque {};
-pub const BN_BLINDING = struct_bn_blinding_st; // src/deps/boringssl/include/openssl/rsa.h:788:12: warning: struct demoted to opaque type - has bitfield
+pub const BN_BLINDING = struct_bn_blinding_st; // boringssl/include/openssl/rsa.h:788:12: warning: struct demoted to opaque type - has bitfield
 pub const struct_rsa_st = opaque {};
 pub const RSA = struct_rsa_st;
 pub const struct_dsa_st = extern struct {
@@ -292,8 +292,8 @@ pub const struct_buf_mem_st = extern struct {
     max: usize,
 };
 pub const BUF_MEM = struct_buf_mem_st;
-pub const CBB = struct_cbb_st; // src/deps/boringssl/include/openssl/bytestring.h:403:12: warning: struct demoted to opaque type - has bitfield
-pub const struct_cbb_buffer_st = opaque {}; // src/deps/boringssl/include/openssl/bytestring.h:418:12: warning: struct demoted to opaque type - has bitfield
+pub const CBB = struct_cbb_st; // boringssl/include/openssl/bytestring.h:403:12: warning: struct demoted to opaque type - has bitfield
+pub const struct_cbb_buffer_st = opaque {}; // boringssl/include/openssl/bytestring.h:418:12: warning: struct demoted to opaque type - has bitfield
 pub const struct_cbb_child_st = opaque {};
 const union_unnamed_3 = extern union {
     base: struct_cbb_buffer_st,
@@ -5035,7 +5035,7 @@ pub extern fn d2i_PKCS8PrivateKey_bio(bp: [*c]BIO, x: [*c][*c]EVP_PKEY, cb: ?*co
 // pub extern fn d2i_PKCS8PrivateKey_fp(fp: [*c]FILE, x: [*c][*c]EVP_PKEY, cb: ?*const pem_password_cb, u: ?*anyopaque) [*c]EVP_PKEY;
 // pub extern fn PEM_write_PKCS8PrivateKey(fp: [*c]FILE, x: [*c]EVP_PKEY, enc: ?*const EVP_CIPHER, kstr: [*c]u8, klen: c_int, cd: ?*const pem_password_cb, u: ?*anyopaque) c_int;
 
-pub extern fn HMAC(evp_md: ?*const EVP_MD, key: ?*const anyopaque, key_len: usize, data: [*c]const u8, data_len: usize, out: [*c]u8, out_len: [*c]c_uint) [*c]u8;
+pub extern fn HMAC(evp_md: *const EVP_MD, key: *const anyopaque, key_len: usize, data: [*]const u8, data_len: usize, out: [*]u8, out_len: *c_uint) ?[*]u8;
 pub extern fn HMAC_CTX_init(ctx: [*c]HMAC_CTX) void;
 pub extern fn HMAC_CTX_new() [*c]HMAC_CTX;
 pub extern fn HMAC_CTX_cleanup(ctx: [*c]HMAC_CTX) void;
@@ -18737,7 +18737,7 @@ pub extern fn RAND_bytes(buf: [*]u8, len: usize) c_int;
 /// Hence, this function should never be called by libraries.
 pub extern fn RAND_enable_fork_unsafe_buffering(c_int) void;
 
-pub extern fn SSL_new(ctx: ?*SSL_CTX) *SSL;
+pub extern fn SSL_new(ctx: ?*SSL_CTX) ?*SSL;
 
 pub extern fn EVP_md4() *const EVP_MD;
 pub extern fn EVP_md5() *const EVP_MD;
@@ -19162,7 +19162,6 @@ pub const SSL_CTX = opaque {
         if (auto_crypto_buffer_pool == null) auto_crypto_buffer_pool = CRYPTO_BUFFER_POOL_new();
         SSL_CTX_set0_buffer_pool(ctx, auto_crypto_buffer_pool);
         _ = SSL_CTX_set_cipher_list(ctx, SSL_DEFAULT_CIPHER_LIST);
-        SSL_CTX_set_quiet_shutdown(ctx, 1);
     }
 
     pub inline fn setCustomVerify(this: *SSL_CTX, cb: ?VerifyCallback) void {

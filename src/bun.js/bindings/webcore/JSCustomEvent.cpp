@@ -166,10 +166,10 @@ template<> JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES JSCustomEventDOMConstruc
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto type = convert<IDLAtomStringAdaptor<IDLDOMString>>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument1 = callFrame->argument(1);
     auto eventInitDict = convert<IDLDictionary<CustomEvent::Init>>(*lexicalGlobalObject, argument1.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     auto object = CustomEvent::create(type, WTFMove(eventInitDict));
     if constexpr (IsExceptionOr<decltype(object)>)
         RETURN_IF_EXCEPTION(throwScope, {});
@@ -278,16 +278,16 @@ static inline JSC::EncodedJSValue jsCustomEventPrototypeFunction_initCustomEvent
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto type = convert<IDLAtomStringAdaptor<IDLDOMString>>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument1 = callFrame->argument(1);
     auto bubbles = convert<IDLBoolean>(*lexicalGlobalObject, argument1.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument2 = callFrame->argument(2);
     auto cancelable = convert<IDLBoolean>(*lexicalGlobalObject, argument2.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument3 = callFrame->argument(3);
     auto detail = argument3.value().isUndefined() ? jsNull() : convert<IDLAny>(*lexicalGlobalObject, argument3.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLUndefined>(*lexicalGlobalObject, throwScope, [&]() -> decltype(auto) { return impl.initCustomEvent(type, WTFMove(bubbles), WTFMove(cancelable), WTFMove(detail)); })));
 }
 
@@ -333,7 +333,7 @@ void JSCustomEvent::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     auto* thisObject = jsCast<JSCustomEvent*>(cell);
     analyzer.setWrappedObjectForCell(cell, &thisObject->wrapped());
     if (thisObject->scriptExecutionContext())
-        analyzer.setLabelForCell(cell, "url " + thisObject->scriptExecutionContext()->url().string());
+        analyzer.setLabelForCell(cell, makeString("url "_s, thisObject->scriptExecutionContext()->url().string()));
     Base::analyzeHeap(cell, analyzer);
 }
 
@@ -355,18 +355,18 @@ JSC::JSValue toJSNewlyCreated(JSC::JSGlobalObject*, JSDOMGlobalObject* globalObj
 
     //     if constexpr (std::is_polymorphic_v<CustomEvent>) {
     // #if ENABLE(BINDING_INTEGRITY)
-    //         const void* actualVTablePointer = getVTablePointer(impl.ptr());
+    //         // const void* actualVTablePointer = getVTablePointer(impl.ptr());
     // #if PLATFORM(WIN)
     //         void* expectedVTablePointer = __identifier("??_7CustomEvent@WebCore@@6B@");
     // #else
-    //         void* expectedVTablePointer = &_ZTVN7WebCore11CustomEventE[2];
+    //         // void* expectedVTablePointer = &_ZTVN7WebCore11CustomEventE[2];
     // #endif
 
     //         // If you hit this assertion you either have a use after free bug, or
     //         // CustomEvent has subclasses. If CustomEvent has subclasses that get passed
     //         // to toJS() we currently require CustomEvent you to opt out of binding hardening
     //         // by adding the SkipVTableValidation attribute to the interface IDL definition
-    //         RELEASE_ASSERT(actualVTablePointer == expectedVTablePointer);
+    //         // RELEASE_ASSERT(actualVTablePointer == expectedVTablePointer);
     // #endif
     //     }
     return createWrapper<CustomEvent>(globalObject, WTFMove(impl));

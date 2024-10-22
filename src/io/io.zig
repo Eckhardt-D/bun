@@ -25,40 +25,43 @@ pub const Loop = struct {
     active: usize = 0,
 
     var loop: Loop = undefined;
-    var has_loaded_loop: bool = false;
+
+    fn load() void {
+        loop = Loop{
+            .waker = bun.Async.Waker.init() catch @panic("failed to initialize waker"),
+        };
+        if (comptime Environment.isLinux) {
+            loop.epoll_fd = bun.toFD(std.posix.epoll_create1(std.os.linux.EPOLL.CLOEXEC | 0) catch @panic("Failed to create epoll file descriptor"));
+
+            {
+                var epoll = std.mem.zeroes(std.os.linux.epoll_event);
+                epoll.events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP;
+                epoll.data.ptr = @intFromPtr(&loop);
+                const rc = std.os.linux.epoll_ctl(loop.epoll_fd.cast(), std.os.linux.EPOLL.CTL_ADD, loop.waker.getFd().cast(), &epoll);
+
+                switch (bun.C.getErrno(rc)) {
+                    .SUCCESS => {},
+                    else => |err| bun.Output.panic("Failed to wait on epoll {s}", .{@tagName(err)}),
+                }
+            }
+        }
+        var thread = std.Thread.spawn(.{
+            .allocator = bun.default_allocator,
+
+            // smaller thread, since it's not doing much.
+            .stack_size = 1024 * 1024 * 2,
+        }, onSpawnIOThread, .{}) catch @panic("Failed to spawn IO watcher thread");
+        thread.detach();
+    }
+    var once = std.once(load);
 
     pub fn get() *Loop {
         if (Environment.isWindows) {
             @panic("Do not use this API on windows");
         }
 
-        if (!@atomicRmw(bool, &has_loaded_loop, std.builtin.AtomicRmwOp.Xchg, true, .monotonic)) {
-            loop = Loop{
-                .waker = bun.Async.Waker.init() catch @panic("failed to initialize waker"),
-            };
-            if (comptime Environment.isLinux) {
-                loop.epoll_fd = bun.toFD(std.posix.epoll_create1(std.os.linux.EPOLL.CLOEXEC | 0) catch @panic("Failed to create epoll file descriptor"));
+        once.call();
 
-                {
-                    var epoll = std.mem.zeroes(std.os.linux.epoll_event);
-                    epoll.events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP;
-                    epoll.data.ptr = @intFromPtr(&loop);
-                    const rc = std.os.linux.epoll_ctl(loop.epoll_fd.cast(), std.os.linux.EPOLL.CTL_ADD, loop.waker.getFd().cast(), &epoll);
-
-                    switch (bun.C.getErrno(rc)) {
-                        .SUCCESS => {},
-                        else => |err| bun.Output.panic("Failed to wait on epoll {s}", .{@tagName(err)}),
-                    }
-                }
-            }
-            var thread = std.Thread.spawn(.{
-                .allocator = bun.default_allocator,
-
-                // smaller thread, since it's not doing much.
-                .stack_size = 1024 * 1024 * 2,
-            }, onSpawnIOThread, .{}) catch @panic("Failed to spawn IO watcher thread");
-            thread.detach();
-        }
         return &loop;
     }
 
@@ -123,8 +126,14 @@ pub const Loop = struct {
                             }
                         },
                         .close => |close| {
-                            close.poll.unregisterWithFd(this.pollfd(), close.fd);
-                            this.active -= 1;
+                            log("close({}, registered={any})", .{ close.fd, close.poll.flags.contains(.registered) });
+                            // Only remove from the interest list if it was previously registered.
+                            // Otherwise, epoll gets confused.
+                            // This state can happen if polling for readable/writable previously failed.
+                            if (close.poll.flags.contains(.was_ever_registered)) {
+                                close.poll.unregisterWithFd(this.pollfd(), close.fd);
+                                this.active -= 1;
+                            }
                             close.onDone(close.ctx);
                         },
                     }
@@ -563,7 +572,6 @@ pub const Poll = struct {
             fd.cast(),
             null,
         );
-        this.flags.remove(.was_ever_registered);
         this.flags.remove(.registered);
     }
 
@@ -641,7 +649,7 @@ pub const Poll = struct {
 
             var event = linux.epoll_event{ .events = flags, .data = .{ .u64 = @intFromPtr(Pollable.init(tag, this).ptr()) } };
 
-            const op: u32 = if (this.flags.contains(.registered) or this.flags.contains(.needs_rearm)) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
+            const op: u32 = if (this.flags.contains(.was_ever_registered) or this.flags.contains(.needs_rearm)) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
 
             const ctl = linux.epoll_ctl(
                 watcher_fd.cast(),
@@ -649,11 +657,15 @@ pub const Poll = struct {
                 fd.cast(),
                 &event,
             );
-            this.flags.insert(.registered);
-            this.flags.insert(.was_ever_registered);
+
             if (JSC.Maybe(void).errnoSys(ctl, .epoll_ctl)) |errno| {
                 return errno;
             }
+            // Only mark if it successfully registered.
+            // If it failed to register, we don't want to unregister it later if
+            // it never had done so in the first place.
+            this.flags.insert(.registered);
+            this.flags.insert(.was_ever_registered);
         } else {
             @compileError("epoll not supported on this platform");
         }

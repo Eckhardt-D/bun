@@ -82,7 +82,7 @@ pub fn ConcurrentPromiseTask(comptime Context: type) type {
         }
 
         pub fn deinit(this: *This) void {
-            this.promise.strong.deinit();
+            this.promise.deinit();
             this.destroy();
         }
     };
@@ -319,8 +319,11 @@ pub const JSCScheduler = struct {
     export fn Bun__queueJSCDeferredWorkTaskConcurrently(jsc_vm: *VirtualMachine, task: *JSCScheduler.JSCDeferredWorkTask) void {
         JSC.markBinding(@src());
         var loop = jsc_vm.eventLoop();
-        var concurrent_task = bun.default_allocator.create(ConcurrentTask) catch bun.outOfMemory();
-        loop.enqueueTaskConcurrent(concurrent_task.from(task, .auto_deinit));
+        loop.enqueueTaskConcurrent(ConcurrentTask.new(.{
+            .task = Task.init(task),
+            .next = null,
+            .auto_delete = true,
+        }));
     }
 
     comptime {
@@ -377,8 +380,8 @@ const Futimes = JSC.Node.Async.futimes;
 const Lchmod = JSC.Node.Async.lchmod;
 const Lchown = JSC.Node.Async.lchown;
 const Unlink = JSC.Node.Async.unlink;
-const BrotliDecoder = JSC.API.BrotliDecoder;
-const BrotliEncoder = JSC.API.BrotliEncoder;
+const NativeZlib = JSC.API.NativeZlib;
+const NativeBrotli = JSC.API.NativeBrotli;
 
 const ShellGlobTask = bun.shell.interpret.Interpreter.Expansion.ShellGlobTask;
 const ShellRmTask = bun.shell.Interpreter.Builtin.Rm.ShellRmTask;
@@ -399,6 +402,8 @@ const ProcessWaiterThreadTask = if (Environment.isPosix) bun.spawn.WaiterThread.
 const ProcessMiniEventLoopWaiterThreadTask = if (Environment.isPosix) bun.spawn.WaiterThread.ProcessMiniEventLoopQueue.ResultTask else opaque {};
 const ShellAsyncSubprocessDone = bun.shell.Interpreter.Cmd.ShellAsyncSubprocessDone;
 const RuntimeTranspilerStore = JSC.RuntimeTranspilerStore;
+const ServerAllConnectionsClosedTask = @import("./api/server.zig").ServerAllConnectionsClosedTask;
+
 // Task.get(ReadFileTask) -> ?ReadFileTask
 pub const Task = TaggedPointerUnion(.{
     FetchTasklet,
@@ -459,8 +464,8 @@ pub const Task = TaggedPointerUnion(.{
     Lchmod,
     Lchown,
     Unlink,
-    BrotliEncoder,
-    BrotliDecoder,
+    NativeZlib,
+    NativeBrotli,
     ShellGlobTask,
     ShellRmTask,
     ShellRmDirTask,
@@ -475,9 +480,10 @@ pub const Task = TaggedPointerUnion(.{
     ShellAsyncSubprocessDone,
     TimerObject,
     bun.shell.Interpreter.Builtin.Yes.YesTask,
-
     ProcessWaiterThreadTask,
     RuntimeTranspilerStore,
+    ServerAllConnectionsClosedTask,
+    bun.bake.DevServer.HotReloadTask,
 });
 const UnboundedQueue = @import("./unbounded_queue.zig").UnboundedQueue;
 pub const ConcurrentTask = struct {
@@ -486,19 +492,18 @@ pub const ConcurrentTask = struct {
     auto_delete: bool = false,
 
     pub const Queue = UnboundedQueue(ConcurrentTask, .next);
+    pub usingnamespace bun.New(@This());
 
     pub const AutoDeinit = enum {
         manual_deinit,
         auto_deinit,
     };
     pub fn create(task: Task) *ConcurrentTask {
-        const created = bun.default_allocator.create(ConcurrentTask) catch bun.outOfMemory();
-        created.* = .{
+        return ConcurrentTask.new(.{
             .task = task,
             .next = null,
             .auto_delete = true,
-        };
-        return created;
+        });
     }
 
     pub fn createFrom(task: anytype) *ConcurrentTask {
@@ -769,7 +774,7 @@ pub const EventLoop = struct {
     waker: ?Waker = null,
     forever_timer: ?*uws.Timer = null,
     deferred_tasks: DeferredTaskQueue = .{},
-    uws_loop: if (Environment.isWindows) *uws.Loop else void = undefined,
+    uws_loop: if (Environment.isWindows) ?*uws.Loop else void = if (Environment.isWindows) null else {},
 
     debug: Debug = .{},
     entered_event_loop_count: isize = 0,
@@ -869,14 +874,22 @@ pub const EventLoop = struct {
         this.enter();
         defer this.exit();
 
-        const result = callback.callWithThis(globalObject, thisValue, arguments);
-
-        if (result.toError()) |err| {
-            _ = this.virtual_machine.uncaughtException(globalObject, err, false);
-        }
+        _ = callback.call(globalObject, thisValue, arguments) catch |err|
+            globalObject.reportActiveExceptionAsUnhandled(err);
     }
 
-    pub fn tickQueueWithCount(this: *EventLoop, comptime queue_name: []const u8) u32 {
+    pub fn runCallbackWithResult(this: *EventLoop, callback: JSC.JSValue, globalObject: *JSC.JSGlobalObject, thisValue: JSC.JSValue, arguments: []const JSC.JSValue) JSC.JSValue {
+        this.enter();
+        defer this.exit();
+
+        const result = callback.call(globalObject, thisValue, arguments) catch |err| {
+            globalObject.reportActiveExceptionAsUnhandled(err);
+            return .zero;
+        };
+        return result;
+    }
+
+    fn tickQueueWithCount(this: *EventLoop, virtual_machine: *VirtualMachine, comptime queue_name: []const u8) u32 {
         var global = this.global;
         const global_vm = global.vm();
         var counter: usize = 0;
@@ -1015,11 +1028,15 @@ pub const EventLoop = struct {
                     transform_task.deinit();
                 },
                 @field(Task.Tag, @typeName(HotReloadTask)) => {
-                    var transform_task: *HotReloadTask = task.get(HotReloadTask).?;
-                    transform_task.*.run();
+                    const transform_task: *HotReloadTask = task.get(HotReloadTask).?;
+                    transform_task.run();
                     transform_task.deinit();
                     // special case: we return
                     return 0;
+                },
+                @field(Task.Tag, typeBaseName(@typeName(bun.bake.DevServer.HotReloadTask))) => {
+                    const hmr_task: *bun.bake.DevServer.HotReloadTask = task.get(bun.bake.DevServer.HotReloadTask).?;
+                    hmr_task.run();
                 },
                 @field(Task.Tag, typeBaseName(@typeName(FSWatchTask))) => {
                     var transform_task: *FSWatchTask = task.get(FSWatchTask).?;
@@ -1039,7 +1056,7 @@ pub const EventLoop = struct {
                     any.run(global);
                 },
                 @field(Task.Tag, typeBaseName(@typeName(PollPendingModulesTask))) => {
-                    this.virtual_machine.modules.onPoll();
+                    virtual_machine.modules.onPoll();
                 },
                 @field(Task.Tag, typeBaseName(@typeName(GetAddrInfoRequestTask))) => {
                     if (Environment.os == .windows) @panic("This should not be reachable on Windows");
@@ -1208,12 +1225,12 @@ pub const EventLoop = struct {
                     var any: *Unlink = task.get(Unlink).?;
                     any.runFromJSThread();
                 },
-                @field(Task.Tag, typeBaseName(@typeName(BrotliEncoder))) => {
-                    var any: *BrotliEncoder = task.get(BrotliEncoder).?;
+                @field(Task.Tag, typeBaseName(@typeName(NativeZlib))) => {
+                    var any: *NativeZlib = task.get(NativeZlib).?;
                     any.runFromJSThread();
                 },
-                @field(Task.Tag, typeBaseName(@typeName(BrotliDecoder))) => {
-                    var any: *BrotliDecoder = task.get(BrotliDecoder).?;
+                @field(Task.Tag, typeBaseName(@typeName(NativeBrotli))) => {
+                    var any: *NativeBrotli = task.get(NativeBrotli).?;
                     any.runFromJSThread();
                 },
                 @field(Task.Tag, typeBaseName(@typeName(ProcessWaiterThreadTask))) => {
@@ -1227,14 +1244,15 @@ pub const EventLoop = struct {
                 },
                 @field(Task.Tag, typeBaseName(@typeName(TimerObject))) => {
                     var any: *TimerObject = task.get(TimerObject).?;
-                    any.runImmediateTask(this.virtual_machine);
+                    any.runImmediateTask(virtual_machine);
+                },
+                @field(Task.Tag, typeBaseName(@typeName(ServerAllConnectionsClosedTask))) => {
+                    var any: *ServerAllConnectionsClosedTask = task.get(ServerAllConnectionsClosedTask).?;
+                    any.runFromJSThread(virtual_machine);
                 },
 
-                else => if (Environment.allow_assert) {
-                    bun.Output.prettyln("\nUnexpected tag: {s}\n", .{@tagName(task.tag())});
-                } else {
-                    log("\nUnexpected tag: {s}\n", .{@tagName(task.tag())});
-                    unreachable;
+                else => {
+                    bun.Output.panic("Unexpected tag: {s}", .{@tagName(task.tag())});
                 },
             }
 
@@ -1245,21 +1263,26 @@ pub const EventLoop = struct {
         return @as(u32, @truncate(counter));
     }
 
-    pub fn tickWithCount(this: *EventLoop) u32 {
-        return this.tickQueueWithCount("tasks");
+    fn tickWithCount(this: *EventLoop, virtual_machine: *VirtualMachine) u32 {
+        return this.tickQueueWithCount(virtual_machine, "tasks");
     }
 
-    pub fn tickImmediateTasks(this: *EventLoop) void {
-        _ = this.tickQueueWithCount("immediate_tasks");
+    pub fn tickImmediateTasks(this: *EventLoop, virtual_machine: *VirtualMachine) void {
+        _ = this.tickQueueWithCount(virtual_machine, "immediate_tasks");
     }
 
-    pub fn tickConcurrent(this: *EventLoop) void {
+    fn tickConcurrent(this: *EventLoop) void {
         _ = this.tickConcurrentWithCount();
     }
 
-    pub fn tickConcurrentWithCount(this: *EventLoop) usize {
-        JSC.markBinding(@src());
-        const delta = this.concurrent_ref.swap(0, .monotonic);
+    /// Check whether refConcurrently has been called but the change has not yet been applied to the
+    /// underlying event loop's `active` counter
+    pub fn hasPendingRefs(this: *const EventLoop) bool {
+        return this.concurrent_ref.load(.seq_cst) > 0;
+    }
+
+    fn updateCounts(this: *EventLoop) void {
+        const delta = this.concurrent_ref.swap(0, .seq_cst);
         const loop = this.virtual_machine.event_loop_handle.?;
         if (comptime Environment.isWindows) {
             if (delta > 0) {
@@ -1276,6 +1299,10 @@ pub const EventLoop = struct {
                 loop.active -= @intCast(-delta);
             }
         }
+    }
+
+    pub fn tickConcurrentWithCount(this: *EventLoop) usize {
+        this.updateCounts();
 
         var concurrent = this.concurrent_tasks.popBatch();
         const count = concurrent.count;
@@ -1296,8 +1323,8 @@ pub const EventLoop = struct {
 
         while (iter.next()) |task| {
             if (to_destroy) |dest| {
-                bun.default_allocator.destroy(dest);
                 to_destroy = null;
+                dest.destroy();
             }
 
             if (task.auto_delete) {
@@ -1311,7 +1338,7 @@ pub const EventLoop = struct {
         }
 
         if (to_destroy) |dest| {
-            bun.default_allocator.destroy(dest);
+            dest.destroy();
         }
 
         return this.tasks.count - start_count;
@@ -1319,7 +1346,7 @@ pub const EventLoop = struct {
 
     inline fn usocketsLoop(this: *const EventLoop) *uws.Loop {
         if (comptime Environment.isWindows) {
-            return this.uws_loop;
+            return this.uws_loop.?;
         }
 
         return this.virtual_machine.event_loop_handle.?;
@@ -1330,7 +1357,7 @@ pub const EventLoop = struct {
         var loop = this.usocketsLoop();
 
         this.flushImmediateQueue();
-        this.tickImmediateTasks();
+        this.tickImmediateTasks(ctx);
 
         if (comptime Environment.isPosix) {
             // Some tasks need to keep the event loop alive for one more tick.
@@ -1421,7 +1448,7 @@ pub const EventLoop = struct {
         var loop = this.usocketsLoop();
         var ctx = this.virtual_machine;
         this.flushImmediateQueue();
-        this.tickImmediateTasks();
+        this.tickImmediateTasks(ctx);
 
         if (comptime Environment.isPosix) {
             const pending_unref = ctx.pending_unref_counter;
@@ -1470,7 +1497,7 @@ pub const EventLoop = struct {
             const global_vm = ctx.jsc;
 
             while (true) {
-                while (this.tickWithCount() > 0) : (this.global.handleRejectedPromises()) {
+                while (this.tickWithCount(ctx) > 0) : (this.global.handleRejectedPromises()) {
                     this.tickConcurrent();
                 } else {
                     this.drainMicrotasksWithGlobal(global, global_vm);
@@ -1480,7 +1507,7 @@ pub const EventLoop = struct {
                 break;
             }
 
-            while (this.tickWithCount() > 0) {
+            while (this.tickWithCount(ctx) > 0) {
                 this.tickConcurrent();
             }
 
@@ -1490,11 +1517,11 @@ pub const EventLoop = struct {
 
     pub fn waitForPromise(this: *EventLoop, promise: JSC.AnyPromise) void {
         switch (promise.status(this.virtual_machine.jsc)) {
-            JSC.JSPromise.Status.Pending => {
-                while (promise.status(this.virtual_machine.jsc) == .Pending) {
+            .pending => {
+                while (promise.status(this.virtual_machine.jsc) == .pending) {
                     this.tick();
 
-                    if (promise.status(this.virtual_machine.jsc) == .Pending) {
+                    if (promise.status(this.virtual_machine.jsc) == .pending) {
                         this.autoTick();
                     }
                 }
@@ -1506,11 +1533,11 @@ pub const EventLoop = struct {
     pub fn waitForPromiseWithTermination(this: *EventLoop, promise: JSC.AnyPromise) void {
         const worker = this.virtual_machine.worker orelse @panic("EventLoop.waitForPromiseWithTermination: worker is not initialized");
         switch (promise.status(this.virtual_machine.jsc)) {
-            JSC.JSPromise.Status.Pending => {
-                while (!worker.hasRequestedTerminate() and promise.status(this.virtual_machine.jsc) == .Pending) {
+            .pending => {
+                while (!worker.hasRequestedTerminate() and promise.status(this.virtual_machine.jsc) == .pending) {
                     this.tick();
 
-                    if (!worker.hasRequestedTerminate() and promise.status(this.virtual_machine.jsc) == .Pending) {
+                    if (!worker.hasRequestedTerminate() and promise.status(this.virtual_machine.jsc) == .pending) {
                         this.autoTick();
                     }
                 }
@@ -1567,7 +1594,9 @@ pub const EventLoop = struct {
 
     pub fn wakeup(this: *EventLoop) void {
         if (comptime Environment.isWindows) {
-            this.uws_loop.wakeup();
+            if (this.uws_loop) |loop| {
+                loop.wakeup();
+            }
             return;
         }
 
@@ -1576,11 +1605,14 @@ pub const EventLoop = struct {
         }
     }
     pub fn enqueueTaskConcurrent(this: *EventLoop, task: *ConcurrentTask) void {
-        JSC.markBinding(@src());
         if (comptime Environment.allow_assert) {
             if (this.virtual_machine.has_terminated) {
                 @panic("EventLoop.enqueueTaskConcurrent: VM has terminated");
             }
+        }
+
+        if (comptime Environment.isDebug) {
+            log("enqueueTaskConcurrent({s})", .{task.task.typeName() orelse "[unknown]"});
         }
 
         this.concurrent_tasks.push(task);
@@ -1588,11 +1620,14 @@ pub const EventLoop = struct {
     }
 
     pub fn enqueueTaskConcurrentBatch(this: *EventLoop, batch: ConcurrentTask.Queue.Batch) void {
-        JSC.markBinding(@src());
         if (comptime Environment.allow_assert) {
             if (this.virtual_machine.has_terminated) {
                 @panic("EventLoop.enqueueTaskConcurrent: VM has terminated");
             }
+        }
+
+        if (comptime Environment.isDebug) {
+            log("enqueueTaskConcurrentBatch({d})", .{batch.count});
         }
 
         this.concurrent_tasks.pushBatch(batch.front.?, batch.last.?, batch.count);
@@ -1600,14 +1635,13 @@ pub const EventLoop = struct {
     }
 
     pub fn refConcurrently(this: *EventLoop) void {
-        // TODO maybe this should be AcquireRelease
-        _ = this.concurrent_ref.fetchAdd(1, .monotonic);
+        _ = this.concurrent_ref.fetchAdd(1, .seq_cst);
         this.wakeup();
     }
 
     pub fn unrefConcurrently(this: *EventLoop) void {
         // TODO maybe this should be AcquireRelease
-        _ = this.concurrent_ref.fetchSub(1, .monotonic);
+        _ = this.concurrent_ref.fetchSub(1, .seq_cst);
         this.wakeup();
     }
 };
@@ -1667,8 +1701,7 @@ pub const MiniVM = struct {
     }
 
     pub inline fn incrementPendingUnrefCounter(this: @This()) void {
-        _ = this; // autofix
-
+        _ = this;
         @panic("FIXME TODO");
     }
 
@@ -1789,7 +1822,7 @@ pub const MiniEventLoop = struct {
     pub fn filePolls(this: *MiniEventLoop) *Async.FilePoll.Store {
         return this.file_polls_ orelse {
             this.file_polls_ = this.allocator.create(Async.FilePoll.Store) catch bun.outOfMemory();
-            this.file_polls_.?.* = Async.FilePoll.Store.init(this.allocator);
+            this.file_polls_.?.* = Async.FilePoll.Store.init();
             return this.file_polls_.?;
         };
     }
@@ -1922,9 +1955,8 @@ pub const MiniEventLoop = struct {
 
     pub fn stderr(this: *MiniEventLoop) *JSC.WebCore.Blob.Store {
         return this.stderr_store orelse brk: {
-            const store = bun.default_allocator.create(JSC.WebCore.Blob.Store) catch bun.outOfMemory();
             var mode: bun.Mode = 0;
-            const fd = if (comptime Environment.isWindows) bun.FDImpl.fromUV(2).encode() else bun.STDERR_FD;
+            const fd = if (Environment.isWindows) bun.FDImpl.fromUV(2).encode() else bun.STDERR_FD;
 
             switch (bun.sys.fstat(fd)) {
                 .result => |stat| {
@@ -1933,7 +1965,7 @@ pub const MiniEventLoop = struct {
                 .err => {},
             }
 
-            store.* = JSC.WebCore.Blob.Store{
+            const store = JSC.WebCore.Blob.Store.new(.{
                 .ref_count = std.atomic.Value(u32).init(2),
                 .allocator = bun.default_allocator,
                 .data = .{
@@ -1945,7 +1977,7 @@ pub const MiniEventLoop = struct {
                         .mode = mode,
                     },
                 },
-            };
+            });
 
             this.stderr_store = store;
             break :brk store;
@@ -1954,7 +1986,6 @@ pub const MiniEventLoop = struct {
 
     pub fn stdout(this: *MiniEventLoop) *JSC.WebCore.Blob.Store {
         return this.stdout_store orelse brk: {
-            const store = bun.default_allocator.create(JSC.WebCore.Blob.Store) catch bun.outOfMemory();
             var mode: bun.Mode = 0;
             const fd = if (Environment.isWindows) bun.FDImpl.fromUV(1).encode() else bun.STDOUT_FD;
 
@@ -1965,7 +1996,7 @@ pub const MiniEventLoop = struct {
                 .err => {},
             }
 
-            store.* = JSC.WebCore.Blob.Store{
+            const store = JSC.WebCore.Blob.Store.new(.{
                 .ref_count = std.atomic.Value(u32).init(2),
                 .allocator = bun.default_allocator,
                 .data = .{
@@ -1977,7 +2008,7 @@ pub const MiniEventLoop = struct {
                         .mode = mode,
                     },
                 },
-            };
+            });
 
             this.stdout_store = store;
             break :brk store;

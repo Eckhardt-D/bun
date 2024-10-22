@@ -23,11 +23,10 @@
 import { Glob, GlobScanOptions } from "bun";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fg from "fast-glob";
-import * as path from "path";
-import { tempFixturesDir, createTempDirectoryWithBrokenSymlinks, prepareEntries } from "./util";
 import { tempDirWithFiles, tmpdirSync } from "harness";
-import * as os from "node:os";
 import * as fs from "node:fs";
+import * as path from "path";
+import { createTempDirectoryWithBrokenSymlinks, prepareEntries, tempFixturesDir } from "./util";
 
 let origAggressiveGC = Bun.unsafe.gcAggressionLevel();
 let tempBrokenSymlinksDir: string;
@@ -410,9 +409,9 @@ describe("fast-glob e2e tests", async () => {
         ? fg.globSync(pattern, { cwd: testCwd, absolute: true })
         : Array.from(new Glob(pattern).scanSync({ cwd: testCwd, followSymlinks: true, absolute: true }));
 
-      entries = entries.sort().map(entry => entry.slice(absoluteCwd.length + 1));
+      entries = entries.sort().map(entry => entry.slice(testCwd.length + 1));
       entries = prepareEntries(entries);
-      expect(entries.map(stripAbsoluteDir)).toMatchSnapshot(`absolute: ${pattern}`);
+      expect(entries).toMatchSnapshot(`absolute: ${pattern}`);
     });
   });
 

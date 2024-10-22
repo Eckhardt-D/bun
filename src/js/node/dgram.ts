@@ -34,6 +34,14 @@ const kStateSymbol = Symbol("state symbol");
 const async_id_symbol = Symbol("async_id_symbol");
 
 const { hideFromStack, throwNotImplemented } = require("internal/shared");
+const { ERR_SOCKET_BAD_TYPE } = require("internal/errors");
+const {
+  validateString,
+  validateNumber,
+  validateFunction,
+  validatePort,
+  validateAbortSignal,
+} = require("internal/validators");
 
 const {
   FunctionPrototypeBind,
@@ -127,54 +135,6 @@ function isInt32(value) {
   return value === (value | 0);
 }
 
-function validateAbortSignal(signal, name) {
-  if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
-    throw new ERR_INVALID_ARG_TYPE(name, "AbortSignal", signal);
-  }
-}
-hideFromStack(validateAbortSignal);
-
-function validateString(value, name) {
-  if (typeof value !== "string") throw new ERR_INVALID_ARG_TYPE(name, "string", value);
-}
-hideFromStack(validateString);
-
-function validateNumber(value, name, min = undefined, max) {
-  if (typeof value !== "number") throw new ERR_INVALID_ARG_TYPE(name, "number", value);
-
-  if (
-    (min != null && value < min) ||
-    (max != null && value > max) ||
-    ((min != null || max != null) && NumberIsNaN(value))
-  ) {
-    throw new ERR_OUT_OF_RANGE(
-      name,
-      `${min != null ? `>= ${min}` : ""}${min != null && max != null ? " && " : ""}${max != null ? `<= ${max}` : ""}`,
-      value,
-    );
-  }
-}
-hideFromStack(validateNumber);
-
-function validatePort(port, name = "Port", allowZero = true) {
-  if (
-    (typeof port !== "number" && typeof port !== "string") ||
-    (typeof port === "string" && StringPrototypeTrim(port).length === 0) ||
-    +port !== +port >>> 0 ||
-    port > 0xffff ||
-    (port === 0 && !allowZero)
-  ) {
-    throw new ERR_SOCKET_BAD_PORT(name, port, allowZero);
-  }
-  return port | 0;
-}
-hideFromStack(validatePort);
-
-function validateFunction(value, name) {
-  if (typeof value !== "function") throw new ERR_INVALID_ARG_TYPE(name, "Function", value);
-}
-hideFromStack(validateFunction);
-
 // placeholder
 function defaultTriggerAsyncIdScope(triggerAsyncId, block, ...args) {
   return block.$apply(null, args);
@@ -247,6 +207,7 @@ function Socket(type, listener) {
     ipv6Only: options && options.ipv6Only,
     recvBufferSize,
     sendBufferSize,
+    unrefOnBind: false,
   };
 
   if (options?.signal !== undefined) {
@@ -399,6 +360,10 @@ Socket.prototype.bind = function (port_, address_ /* , callback */) {
       },
     }).$then(
       socket => {
+        if (state.unrefOnBind) {
+          socket.unref();
+          state.unrefOnBind = false;
+        }
         state.handle.socket = socket;
         state.receiving = true;
         state.bindState = BIND_STATE_BOUND;
@@ -934,7 +899,11 @@ Socket.prototype.ref = function () {
 Socket.prototype.unref = function () {
   const socket = this[kStateSymbol].handle?.socket;
 
-  if (socket) socket.unref();
+  if (socket) {
+    socket.unref();
+  } else {
+    this[kStateSymbol].unrefOnBind = true;
+  }
 
   return this;
 };

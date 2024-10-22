@@ -1,3 +1,6 @@
+// Note(2024-10-01): there is little reason to use this over std.Thread.Mutex,
+// as we have dropped old macOS versions it didnt support. Additionally, the
+// Zig Standard Library has deadlock protections in debug builds.
 const std = @import("std");
 const Atomic = std.atomic.Value;
 const Futex = @import("./futex.zig");
@@ -103,11 +106,7 @@ pub const Mutex = struct {
 };
 
 pub const Lock = struct {
-    mutex: Mutex,
-
-    pub fn init() Lock {
-        return Lock{ .mutex = Mutex{} };
-    }
+    mutex: Mutex = .{},
 
     pub inline fn lock(this: *Lock) void {
         this.mutex.acquire();
@@ -117,9 +116,25 @@ pub const Lock = struct {
         this.mutex.release();
     }
 
-    pub inline fn assertUnlocked(this: *Lock, comptime message: []const u8) void {
+    pub inline fn releaseAssertUnlocked(this: *Lock, comptime message: []const u8) void {
         if (this.mutex.state.load(.monotonic) != 0) {
             @panic(message);
+        }
+    }
+
+    pub inline fn assertUnlocked(this: *Lock) void {
+        if (std.debug.runtime_safety) {
+            if (this.mutex.state.load(.monotonic) != 0) {
+                @panic("Mutex is expected to be unlocked");
+            }
+        }
+    }
+
+    pub inline fn assertLocked(this: *Lock) void {
+        if (std.debug.runtime_safety) {
+            if (this.mutex.state.load(.monotonic) == 0) {
+                @panic("Mutex is expected to be locked");
+            }
         }
     }
 };

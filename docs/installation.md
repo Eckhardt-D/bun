@@ -30,10 +30,6 @@ $ docker pull oven/bun
 $ docker run --rm --init --ulimit memlock=-1:-1 oven/bun
 ```
 
-```bash#Proto
-$ proto install bun
-```
-
 {% /codetabs %}
 
 ### Windows
@@ -76,8 +72,9 @@ There are also image variants for different operating systems.
 ```bash
 $ docker pull oven/bun:debian
 $ docker pull oven/bun:slim
-$ docker pull oven/bun:alpine
 $ docker pull oven/bun:distroless
+# alpine not recommended until #918 is fixed
+# $ docker pull oven/bun:alpine
 ```
 
 ## Checking installation
@@ -146,7 +143,6 @@ $ bun upgrade
 
 **Scoop users** — To avoid conflicts with Scoop, use `scoop update bun` instead.
 
-**proto users** - Use `proto install bun --pin` instead.
 {% /callout %}
 
 ## Canary builds
@@ -289,10 +285,6 @@ $ npm uninstall -g bun
 
 ```bash#Homebrew
 $ brew uninstall bun
-```
-
-```bash#Proto
-$ proto uninstall bun
 ```
 
 {% /codetabs %}

@@ -1,7 +1,7 @@
-import { ConsoleMessage, Page, launch } from "puppeteer";
 import assert from "assert";
 import { copyFileSync } from "fs";
 import { join } from "path";
+import { ConsoleMessage, Page, launch } from "puppeteer";
 
 const root = join(import.meta.dir, "../");
 
@@ -13,8 +13,39 @@ if (process.argv.length > 2) {
 }
 
 const b = await launch({
-  headless: true,
+  // While puppeteer is migrating to their new headless: `true` mode,
+  // this causes strange issues on macOS in the cloud (AWS and MacStadium).
+  //
+  // There is a GitHub issue, but the discussion is unhelpful:
+  // https://github.com/puppeteer/puppeteer/issues/10153
+  //
+  // Fixes: 'TargetCloseError: Protocol error (Target.setAutoAttach): Target closed'
+  headless: "shell",
   dumpio: true,
+  pipe: true,
+  args: [
+    // Fixes: 'dock_plist is not an NSDictionary'
+    "--no-sandbox",
+    "--single-process",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    // Fixes: 'Navigating frame was detached'
+    "--disable-features=site-per-process",
+    // Uncomment if you want debug logs from Chromium:
+    // "--enable-logging=stderr",
+    // "--v=1",
+  ],
+});
+
+process.on("beforeExit", async reason => {
+  await b?.close?.();
+});
+
+process.once("SIGTERM", () => {
+  b?.close?.();
+  setTimeout(() => {
+    process.exit(0);
+  }, 100);
 });
 
 async function main() {

@@ -1,4 +1,4 @@
-import { resolve, join } from "path";
+import { join, resolve } from "path";
 
 const classes = ["ArrayBufferSink", "FileSink", "HTTPResponseSink", "HTTPSResponseSink"];
 
@@ -713,7 +713,7 @@ void ${className}::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     if (void* wrapped = thisObject->wrapped()) {
         analyzer.setWrappedObjectForCell(cell, wrapped);
         // if (thisObject->scriptExecutionContext())
-        //     analyzer.setLabelForCell(cell, "url " + thisObject->scriptExecutionContext()->url().string());
+        //     analyzer.setLabelForCell(cell, makeString("url ", thisObject->scriptExecutionContext()->url().string()));
     }
     Base::analyzeHeap(cell, analyzer);
 }
@@ -724,7 +724,7 @@ void ${controller}::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     if (void* wrapped = thisObject->wrapped()) {
         analyzer.setWrappedObjectForCell(cell, wrapped);
         // if (thisObject->scriptExecutionContext())
-        //     analyzer.setLabelForCell(cell, "url " + thisObject->scriptExecutionContext()->url().string());
+        //     analyzer.setLabelForCell(cell, makeString("url ", thisObject->scriptExecutionContext()->url().string()));
     }
     Base::analyzeHeap(cell, analyzer);
 }
@@ -896,13 +896,14 @@ extern "C" void ${name}__onReady(JSC__JSValue controllerValue, JSC__JSValue amt,
     if (!function)
         return;
     JSC::JSGlobalObject *globalObject = controller->globalObject();
-
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
     JSC::MarkedArgumentBuffer arguments;
     arguments.append(controller);
     arguments.append(JSC::JSValue::decode(amt));
     arguments.append(JSC::JSValue::decode(offset));
 
     AsyncContextFrame::call(globalObject, function, JSC::jsUndefined(), arguments);
+    RELEASE_AND_RETURN(scope, void());
 }
 
 extern "C" void ${name}__onStart(JSC__JSValue controllerValue)
@@ -920,13 +921,14 @@ extern "C" void ${name}__onClose(JSC__JSValue controllerValue, JSC__JSValue reas
     // only call close once
     controller->m_onClose.clear();
     JSC::JSGlobalObject* globalObject = controller->globalObject();
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
 
     JSC::MarkedArgumentBuffer arguments;
     auto readableStream = controller->m_weakReadableStream.get();
     arguments.append(readableStream ? readableStream : JSC::jsUndefined());
-
     arguments.append(JSC::JSValue::decode(reason));
     AsyncContextFrame::call(globalObject, function, JSC::jsUndefined(), arguments);
+    RELEASE_AND_RETURN(scope, void());
 }
 
 `;

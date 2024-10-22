@@ -1,11 +1,12 @@
 import { spawnSync } from "bun";
-import { describe, expect, it } from "bun:test";
+import { expect, it } from "bun:test";
 import { bunEnv, bunExe, ospath } from "harness";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import * as Module from "node:module";
+import Module from "node:module";
+import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import sync from "./require-json.json";
-import { tmpdir } from "node:os";
+import { isModuleResolveFilenameSlowPathEnabled } from "bun:internal-for-testing";
 
 const { path, dir, dirname, filename } = import.meta;
 
@@ -127,7 +128,12 @@ it("Module._cache", () => {
 });
 
 it("Module._resolveFilename()", () => {
-  expect(Module._resolveFilename).toBeUndefined();
+  expect(isModuleResolveFilenameSlowPathEnabled()).toBe(false);
+  const original = Module._resolveFilename;
+  Module._resolveFilename = () => {};
+  expect(isModuleResolveFilenameSlowPathEnabled()).toBe(true);
+  Module._resolveFilename = original;
+  expect(isModuleResolveFilenameSlowPathEnabled()).toBe(false);
 });
 
 it("Module.createRequire(file://url).resolve(file://url)", () => {
@@ -190,7 +196,7 @@ it("import.meta.require (javascript, live bindings)", () => {
 });
 
 it("import.meta.dir", () => {
-  expect(dir).toEndWith(ospath("/bun/test/js/bun/resolve"));
+  expect(dir).toEndWith(ospath("/test/js/bun/resolve"));
 });
 
 it("import.meta.dirname", () => {
@@ -202,7 +208,7 @@ it("import.meta.filename", () => {
 });
 
 it("import.meta.path", () => {
-  expect(path).toEndWith(ospath("/bun/test/js/bun/resolve/import-meta.test.js"));
+  expect(path).toEndWith(ospath("/test/js/bun/resolve/import-meta.test.js"));
 });
 
 it('require("bun") works', () => {

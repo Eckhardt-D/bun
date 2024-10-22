@@ -137,8 +137,8 @@ type _Body = typeof globalThis extends { onerror: any }
       readonly text: () => Promise<string>;
     };
 
+import type { TextDecoder as NodeTextDecoder, TextEncoder as NodeTextEncoder } from "util";
 import type { MessagePort } from "worker_threads";
-import type { TextEncoder as NodeTextEncoder, TextDecoder as NodeTextDecoder } from "util";
 import type { WebSocket as _WebSocket } from "ws";
 
 declare module "*.txt" {
@@ -907,26 +907,42 @@ declare global {
     new (): ShadowRealm;
   };
 
-  /**
-   * Send a HTTP(s) request
-   *
-   * @param request Request object
-   * @param init A structured value that contains settings for the fetch() request.
-   *
-   * @returns A promise that resolves to {@link Response} object.
-   */
+  interface Fetch {
+    /**
+     * Send a HTTP(s) request
+     *
+     * @param request Request object
+     * @param init A structured value that contains settings for the fetch() request.
+     *
+     * @returns A promise that resolves to {@link Response} object.
+     */
+    (request: Request, init?: RequestInit): Promise<Response>;
 
-  // tslint:disable-next-line:unified-signatures
-  function fetch(request: Request, init?: RequestInit): Promise<Response>;
-  /**
-   * Send a HTTP(s) request
-   *
-   * @param url URL string
-   * @param init A structured value that contains settings for the fetch() request.
-   *
-   * @returns A promise that resolves to {@link Response} object.
-   */
-  function fetch(url: string | URL | Request, init?: FetchRequestInit): Promise<Response>;
+    /**
+     * Send a HTTP(s) request
+     *
+     * @param url URL string
+     * @param init A structured value that contains settings for the fetch() request.
+     *
+     * @returns A promise that resolves to {@link Response} object.
+     */
+    (url: string | URL | Request, init?: FetchRequestInit): Promise<Response>;
+
+    (input: string | URL | globalThis.Request, init?: RequestInit): Promise<Response>;
+
+    /**
+     * Start the DNS resolution, TCP connection, and TLS handshake for a request
+     * before the request is actually sent.
+     *
+     * This can reduce the latency of a request when you know there's some
+     * long-running task that will delay the request starting.
+     *
+     * This is a bun-specific API and is not part of the Fetch API specification.
+     */
+    preconnect(url: string | URL): void;
+  }
+
+  var fetch: Fetch;
 
   function queueMicrotask(callback: (...args: any[]) => void): void;
   /**
@@ -939,6 +955,7 @@ declare global {
     ref(): Timer;
     unref(): Timer;
     hasRef(): boolean;
+    refresh(): Timer;
 
     [Symbol.toPrimitive](): number;
   }
@@ -1821,14 +1838,6 @@ declare global {
     withCredentials?: boolean;
   }
 
-  interface EventSource extends Bun.EventSource {}
-  var EventSource: typeof globalThis extends {
-    onerror: any;
-    EventSource: infer T;
-  }
-    ? T
-    : EventSource;
-
   interface PromiseConstructor {
     /**
      * Create a deferred promise, with exposed `resolve` and `reject` methods which can be called
@@ -1901,6 +1910,13 @@ declare global {
      * closely to the `BodyMixin` API.
      */
     formData(): Promise<FormData>;
+
+    arrayBuffer(): Promise<ArrayBuffer>;
+
+    /**
+     * Returns a promise that resolves to the contents of the blob as a Uint8Array (array of bytes) its the same as `new Uint8Array(await blob.arrayBuffer())`
+     */
+    bytes(): Promise<Uint8Array>;
   }
   var Blob: typeof globalThis extends {
     onerror: any;

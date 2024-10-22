@@ -69,8 +69,8 @@ static JSC_DECLARE_HOST_FUNCTION(jsDOMURLConstructorFunction_createObjectURL);
 static JSC_DECLARE_HOST_FUNCTION(jsDOMURLConstructorFunction_revokeObjectURL);
 static JSC_DECLARE_HOST_FUNCTION(jsDOMURLPrototypeFunction_toString);
 
-extern "C" JSC_DECLARE_HOST_FUNCTION(Bun__createObjectURL);
-extern "C" JSC_DECLARE_HOST_FUNCTION(Bun__revokeObjectURL);
+BUN_DECLARE_HOST_FUNCTION(Bun__createObjectURL);
+BUN_DECLARE_HOST_FUNCTION(Bun__revokeObjectURL);
 
 // Attributes
 
@@ -151,10 +151,10 @@ template<> EncodedJSValue JSC_HOST_CALL_ATTRIBUTES JSDOMURLDOMConstructor::const
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto url = convert<IDLUSVString>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument1 = callFrame->argument(1);
     auto base = argument1.value().isUndefined() ? String() : convert<IDLUSVString>(*lexicalGlobalObject, argument1.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     auto object = base.isEmpty() ? DOMURL::create(WTFMove(url)) : DOMURL::create(WTFMove(url), WTFMove(base));
     if constexpr (IsExceptionOr<decltype(object)>)
         RETURN_IF_EXCEPTION(throwScope, {});
@@ -630,10 +630,10 @@ static inline JSC::EncodedJSValue jsDOMURLConstructorFunction_parseBody(JSC::JSG
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto url = convert<IDLUSVString>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument1 = callFrame->argument(1);
     auto base = argument1.value().isUndefined() ? String() : convert<IDLUSVString>(*lexicalGlobalObject, argument1.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLNullable<IDLInterface<DOMURL>>>(*lexicalGlobalObject, *jsCast<JSDOMGlobalObject*>(lexicalGlobalObject), throwScope, DOMURL::parse(WTFMove(url), WTFMove(base)))));
 }
 
@@ -652,10 +652,10 @@ static inline JSC::EncodedJSValue jsDOMURLConstructorFunction_canParseBody(JSC::
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto url = convert<IDLUSVString>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument1 = callFrame->argument(1);
     auto base = argument1.value().isUndefined() ? String() : convert<IDLUSVString>(*lexicalGlobalObject, argument1.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLBoolean>(*lexicalGlobalObject, throwScope, DOMURL::canParse(WTFMove(url), WTFMove(base)))));
 }
 
@@ -690,7 +690,7 @@ static inline JSC::EncodedJSValue jsDOMURLConstructorFunction_createObjectURL1Bo
     return JSValue::encode(jsUndefined());
     // EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     // auto blob = convert<IDLInterface<Blob>>(*lexicalGlobalObject, argument0.value(), [](JSC::JSGlobalObject& lexicalGlobalObject, JSC::ThrowScope& scope) { throwArgumentTypeError(lexicalGlobalObject, scope, 0, "blob", "URL", "createObjectURL", "Blob"); });
-    // RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    // RETURN_IF_EXCEPTION(throwScope, {});
     // RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLDOMString>(*lexicalGlobalObject, throwScope, DOMURL::createObjectURL(*context, *blob))));
 }
 
@@ -707,7 +707,7 @@ static inline JSC::EncodedJSValue jsDOMURLConstructorFunction_revokeObjectURLBod
     return JSValue::encode(jsUndefined());
     // EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     // auto url = convert<IDLDOMString>(*lexicalGlobalObject, argument0.value());
-    // RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    // RETURN_IF_EXCEPTION(throwScope, {});
     // RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLUndefined>(*lexicalGlobalObject, throwScope, [&]() -> decltype(auto) { return DOMURL::revokeObjectURL(*context, WTFMove(url)); })));
 }
 
@@ -789,7 +789,7 @@ void JSDOMURL::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     auto* thisObject = jsCast<JSDOMURL*>(cell);
     analyzer.setWrappedObjectForCell(cell, &thisObject->wrapped());
     if (thisObject->scriptExecutionContext())
-        analyzer.setLabelForCell(cell, "url "_s + thisObject->scriptExecutionContext()->url().string());
+        analyzer.setLabelForCell(cell, makeString("url "_s, thisObject->scriptExecutionContext()->url().string()));
     Base::analyzeHeap(cell, analyzer);
 }
 
@@ -830,18 +830,18 @@ JSC::JSValue toJSNewlyCreated(JSC::JSGlobalObject*, JSDOMGlobalObject* globalObj
 
     if constexpr (std::is_polymorphic_v<DOMURL>) {
 #if ENABLE(BINDING_INTEGRITY)
-        const void* actualVTablePointer = getVTablePointer(impl.ptr());
+        // const void* actualVTablePointer = getVTablePointer(impl.ptr());
 #if PLATFORM(WIN)
         void* expectedVTablePointer = __identifier("??_7DOMURL@WebCore@@6B@");
 #else
-        void* expectedVTablePointer = &_ZTVN7WebCore6DOMURLE[2];
+        // void* expectedVTablePointer = &_ZTVN7WebCore6DOMURLE[2];
 #endif
 
         // If you hit this assertion you either have a use after free bug, or
         // DOMURL has subclasses. If DOMURL has subclasses that get passed
         // to toJS() we currently require DOMURL you to opt out of binding hardening
         // by adding the SkipVTableValidation attribute to the interface IDL definition
-        RELEASE_ASSERT(actualVTablePointer == expectedVTablePointer);
+        // RELEASE_ASSERT(actualVTablePointer == expectedVTablePointer);
 #endif
     }
     return createWrapper<DOMURL>(globalObject, WTFMove(impl));

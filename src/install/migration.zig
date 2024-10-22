@@ -97,9 +97,9 @@ pub fn detectAndLoadOtherLockfile(
     return LoadFromDiskResult{ .not_found = {} };
 }
 
-const ResolvedURLsMap = std.StringHashMapUnmanaged(string);
+const ResolvedURLsMap = bun.StringHashMapUnmanaged(string);
 
-const IdMap = std.StringHashMapUnmanaged(IdMapValue);
+const IdMap = bun.StringHashMapUnmanaged(IdMapValue);
 const IdMapValue = struct {
     /// index into the old package-lock.json package entries.
     old_json_index: u32,
@@ -137,7 +137,7 @@ pub fn migrateNPMLockfile(
     Install.initializeStore();
 
     const json_src = logger.Source.initPathString(abs_path, data);
-    const json = bun.JSON.ParseJSONUTF8(&json_src, log, allocator) catch return error.InvalidNPMLockfile;
+    const json = bun.JSON.parseUTF8(&json_src, log, allocator) catch return error.InvalidNPMLockfile;
 
     if (json.data != .e_object) {
         return error.InvalidNPMLockfile;
@@ -515,23 +515,31 @@ pub fn migrateNPMLockfile(
                 .origin = if (package_id == 0) .local else .npm,
 
                 .arch = if (pkg.get("cpu")) |cpu_array| arch: {
+                    var arch = Npm.Architecture.none.negatable();
                     if (cpu_array.data != .e_array) return error.InvalidNPMLockfile;
-                    var arch: Npm.Architecture = .none;
+                    if (cpu_array.data.e_array.items.len == 0) {
+                        break :arch arch.combine();
+                    }
+
                     for (cpu_array.data.e_array.items.slice()) |item| {
                         if (item.data != .e_string) return error.InvalidNPMLockfile;
-                        arch = arch.apply(item.data.e_string.data);
+                        arch.apply(item.data.e_string.data);
                     }
-                    break :arch arch;
+                    break :arch arch.combine();
                 } else .all,
 
                 .os = if (pkg.get("os")) |cpu_array| arch: {
+                    var os = Npm.OperatingSystem.none.negatable();
                     if (cpu_array.data != .e_array) return error.InvalidNPMLockfile;
-                    var os: Npm.OperatingSystem = .none;
+                    if (cpu_array.data.e_array.items.len == 0) {
+                        break :arch .all;
+                    }
+
                     for (cpu_array.data.e_array.items.slice()) |item| {
                         if (item.data != .e_string) return error.InvalidNPMLockfile;
-                        os = os.apply(item.data.e_string.data);
+                        os.apply(item.data.e_string.data);
                     }
-                    break :arch os;
+                    break :arch os.combine();
                 } else .all,
 
                 .man_dir = String{},
@@ -702,7 +710,7 @@ pub fn migrateNPMLockfile(
             }
             if (expr.data != .e_array) return error.InvalidNPMLockfile;
             const arr: *E.Array = expr.data.e_array;
-            var map = std.StringArrayHashMapUnmanaged(void){};
+            var map = bun.StringArrayHashMapUnmanaged(void){};
             try map.ensureTotalCapacity(allocator, arr.items.len);
             for (arr.items.slice()) |item| {
                 map.putAssumeCapacity(item.asString(allocator) orelse return error.InvalidNPMLockfile, {});

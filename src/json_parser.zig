@@ -41,6 +41,7 @@ const Level = js_ast.Op.Level;
 const Op = js_ast.Op;
 const Scope = js_ast.Scope;
 const locModuleScope = logger.Loc.Empty;
+const Indentation = js_printer.Options.Indentation;
 
 const LEXER_DEBUGGER_WORKAROUND = false;
 
@@ -115,6 +116,7 @@ fn JSONLikeParser(comptime opts: js_lexer.JSONOptions) type {
         opts.json_warn_duplicate_keys,
         opts.was_originally_macro,
         opts.always_decode_escape_sequences,
+        opts.guess_indentation,
     );
 }
 
@@ -127,6 +129,7 @@ fn JSONLikeParser_(
     comptime opts_json_warn_duplicate_keys: bool,
     comptime opts_was_originally_macro: bool,
     comptime opts_always_decode_escape_sequences: bool,
+    comptime opts_guess_indentation: bool,
 ) type {
     const opts = js_lexer.JSONOptions{
         .is_json = opts_is_json,
@@ -137,6 +140,7 @@ fn JSONLikeParser_(
         .json_warn_duplicate_keys = opts_json_warn_duplicate_keys,
         .was_originally_macro = opts_was_originally_macro,
         .always_decode_escape_sequences = opts_always_decode_escape_sequences,
+        .guess_indentation = opts_guess_indentation,
     };
     return struct {
         const Lexer = js_lexer.NewLexer(if (LEXER_DEBUGGER_WORKAROUND) js_lexer.JSONOptions{} else opts);
@@ -706,10 +710,11 @@ var empty_array_data = Expr.Data{ .e_array = &empty_array };
 /// Parse JSON
 /// This leaves UTF-16 strings as UTF-16 strings
 /// The JavaScript Printer will handle escaping strings if necessary
-pub fn ParseJSON(
+pub fn parse(
     source: *const logger.Source,
     log: *logger.Log,
     allocator: std.mem.Allocator,
+    comptime force_utf8: bool,
 ) !Expr {
     var parser = try JSONParser.init(allocator, source.*, log);
     switch (source.contents.len) {
@@ -730,7 +735,7 @@ pub fn ParseJSON(
         else => {},
     }
 
-    return try parser.parseExpr(false, false);
+    return try parser.parseExpr(false, force_utf8);
 }
 
 /// Parse Package JSON
@@ -738,7 +743,7 @@ pub fn ParseJSON(
 /// This eagerly transcodes UTF-16 strings into UTF-8 strings
 /// Use this when the text may need to be reprinted to disk as JSON (and not as JavaScript)
 /// Eagerly converting UTF-8 to UTF-16 can cause a performance issue
-pub fn ParsePackageJSONUTF8(
+pub fn parsePackageJSONUTF8(
     source: *const logger.Source,
     log: *logger.Log,
     allocator: std.mem.Allocator,
@@ -774,7 +779,7 @@ pub fn ParsePackageJSONUTF8(
     return try parser.parseExpr(false, true);
 }
 
-pub fn ParsePackageJSONUTF8AlwaysDecode(
+pub fn parsePackageJSONUTF8AlwaysDecode(
     source: *const logger.Source,
     log: *logger.Log,
     allocator: std.mem.Allocator,
@@ -810,15 +815,68 @@ pub fn ParsePackageJSONUTF8AlwaysDecode(
     return try parser.parseExpr(false, true);
 }
 
+const JsonResult = struct {
+    root: Expr,
+    indentation: Indentation = .{},
+};
+
+pub fn parsePackageJSONUTF8WithOpts(
+    source: *const logger.Source,
+    log: *logger.Log,
+    allocator: std.mem.Allocator,
+    comptime opts: js_lexer.JSONOptions,
+) !JsonResult {
+    const len = source.contents.len;
+
+    switch (len) {
+        // This is to be consisntent with how disabled JS files are handled
+        0 => {
+            return .{
+                .root = Expr{ .loc = logger.Loc{ .start = 0 }, .data = empty_object_data },
+            };
+        },
+        // This is a fast pass I guess
+        2 => {
+            if (strings.eqlComptime(source.contents[0..1], "\"\"") or strings.eqlComptime(source.contents[0..1], "''")) {
+                return .{ .root = Expr{ .loc = logger.Loc{ .start = 0 }, .data = empty_string_data } };
+            } else if (strings.eqlComptime(source.contents[0..1], "{}")) {
+                return .{ .root = Expr{ .loc = logger.Loc{ .start = 0 }, .data = empty_object_data } };
+            } else if (strings.eqlComptime(source.contents[0..1], "[]")) {
+                return .{ .root = Expr{ .loc = logger.Loc{ .start = 0 }, .data = empty_array_data } };
+            }
+        },
+        else => {},
+    }
+
+    var parser = try JSONLikeParser(opts).init(allocator, source.*, log);
+    bun.assert(parser.source().contents.len > 0);
+
+    const root = try parser.parseExpr(false, true);
+
+    return .{
+        .root = root,
+        .indentation = if (comptime opts.guess_indentation) parser.lexer.indent_info.guess else .{},
+    };
+}
+
 /// Parse Package JSON
 /// Allow trailing commas & comments.
 /// This eagerly transcodes UTF-16 strings into UTF-8 strings
 /// Use this when the text may need to be reprinted to disk as JSON (and not as JavaScript)
 /// Eagerly converting UTF-8 to UTF-16 can cause a performance issue
-pub fn ParseJSONUTF8(
+pub fn parseUTF8(
     source: *const logger.Source,
     log: *logger.Log,
     allocator: std.mem.Allocator,
+) !Expr {
+    return try parseUTF8Impl(source, log, allocator, false);
+}
+
+pub fn parseUTF8Impl(
+    source: *const logger.Source,
+    log: *logger.Log,
+    allocator: std.mem.Allocator,
+    comptime check_len: bool,
 ) !Expr {
     const len = source.contents.len;
 
@@ -843,10 +901,15 @@ pub fn ParseJSONUTF8(
     var parser = try JSONParser.init(allocator, source.*, log);
     bun.assert(parser.source().contents.len > 0);
 
-    return try parser.parseExpr(false, true);
+    const result = try parser.parseExpr(false, true);
+    if (comptime check_len) {
+        if (parser.lexer.end >= source.contents.len) return result;
+        try parser.lexer.unexpected();
+        return error.ParserError;
+    }
+    return result;
 }
-
-pub fn ParseJSONForMacro(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator) !Expr {
+pub fn parseForMacro(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator) !Expr {
     switch (source.contents.len) {
         // This is to be consisntent with how disabled JS files are handled
         0 => {
@@ -881,7 +944,7 @@ pub const JSONParseResult = struct {
     };
 };
 
-pub fn ParseJSONForBundling(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator) !JSONParseResult {
+pub fn parseForBundling(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator) !JSONParseResult {
     switch (source.contents.len) {
         // This is to be consisntent with how disabled JS files are handled
         0 => {
@@ -910,7 +973,7 @@ pub fn ParseJSONForBundling(source: *const logger.Source, log: *logger.Log, allo
 
 // threadlocal var env_json_auto_quote_buffer: MutableString = undefined;
 // threadlocal var env_json_auto_quote_buffer_loaded: bool = false;
-pub fn ParseEnvJSON(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator) !Expr {
+pub fn parseEnvJSON(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator) !Expr {
     switch (source.contents.len) {
         // This is to be consisntent with how disabled JS files are handled
         0 => {
@@ -961,7 +1024,7 @@ pub fn ParseEnvJSON(source: *const logger.Source, log: *logger.Log, allocator: s
     }
 }
 
-pub fn ParseTSConfig(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator) !Expr {
+pub fn parseTSConfig(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator, comptime force_utf8: bool) !Expr {
     switch (source.contents.len) {
         // This is to be consisntent with how disabled JS files are handled
         0 => {
@@ -982,7 +1045,7 @@ pub fn ParseTSConfig(source: *const logger.Source, log: *logger.Log, allocator: 
 
     var parser = try TSConfigParser.init(allocator, source.*, log);
 
-    return parser.parseExpr(false, true);
+    return parser.parseExpr(false, force_utf8);
 }
 
 const duplicateKeyJson = "{ \"name\": \"valid\", \"name\": \"invalid\" }";
@@ -1010,15 +1073,15 @@ fn expectPrintedJSON(_contents: string, expected: string) !void {
         "source.json",
         contents,
     );
-    const expr = try ParseJSON(&source, &log, default_allocator);
+    const expr = try parse(&source, &log, default_allocator);
 
     if (log.msgs.items.len > 0) {
-        Global.panic("--FAIL--\nExpr {s}\nLog: {s}\n--FAIL--", .{ expr, log.msgs.items[0].data.text });
+        Output.panic("--FAIL--\nExpr {s}\nLog: {s}\n--FAIL--", .{ expr, log.msgs.items[0].data.text });
     }
 
     const buffer_writer = try js_printer.BufferWriter.init(default_allocator);
     var writer = js_printer.BufferPrinter.init(buffer_writer);
-    const written = try js_printer.printJSON(@TypeOf(&writer), &writer, expr, &source);
+    const written = try js_printer.printJSON(@TypeOf(&writer), &writer, expr, &source, .{});
     var js = writer.ctx.buffer.list.items.ptr[0 .. written + 1];
 
     if (js.len > 1) {

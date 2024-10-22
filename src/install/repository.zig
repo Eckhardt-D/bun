@@ -16,11 +16,125 @@ const string = @import("../string_types.zig").string;
 const strings = @import("../string_immutable.zig");
 const GitSHA = String;
 const Path = bun.path;
+const File = bun.sys.File;
 
 threadlocal var final_path_buf: bun.PathBuffer = undefined;
 threadlocal var ssh_path_buf: bun.PathBuffer = undefined;
 threadlocal var folder_name_buf: bun.PathBuffer = undefined;
 threadlocal var json_path_buf: bun.PathBuffer = undefined;
+
+const SloppyGlobalGitConfig = struct {
+    has_askpass: bool = false,
+    has_ssh_command: bool = false,
+
+    var holder: SloppyGlobalGitConfig = .{};
+    var load_and_parse_once = std.once(loadAndParse);
+
+    pub fn get() SloppyGlobalGitConfig {
+        load_and_parse_once.call();
+        return holder;
+    }
+
+    pub fn loadAndParse() void {
+        const home_dir_path = brk: {
+            if (comptime Environment.isWindows) {
+                if (bun.getenvZ("USERPROFILE")) |env|
+                    break :brk env;
+            } else {
+                if (bun.getenvZ("HOME")) |env|
+                    break :brk env;
+            }
+
+            // won't find anything
+            return;
+        };
+
+        var config_file_path_buf: bun.PathBuffer = undefined;
+        const config_file_path = bun.path.joinAbsStringBufZ(home_dir_path, &config_file_path_buf, &.{".gitconfig"}, .auto);
+        var stack_fallback = std.heap.stackFallback(4096, bun.default_allocator);
+        const allocator = stack_fallback.get();
+        var source = File.toSource(config_file_path, allocator).unwrap() catch {
+            return;
+        };
+        defer allocator.free(source.contents);
+
+        if (comptime Environment.isWindows) {
+            if (strings.BOM.detect(source.contents)) |bom| {
+                source.contents = bom.removeAndConvertToUTF8AndFree(allocator, @constCast(source.contents)) catch bun.outOfMemory();
+            }
+        }
+
+        var remaining = bun.strings.split(source.contents, "\n");
+        var found_askpass = false;
+        var found_ssh_command = false;
+        var @"[core]" = false;
+        while (remaining.next()) |line_| {
+            if (found_askpass and found_ssh_command) break;
+
+            const line = strings.trim(line_, "\t \r");
+
+            if (line.len == 0) continue;
+            // skip comments
+            if (line[0] == '#') continue;
+
+            if (line[0] == '[') {
+                if (strings.indexOfChar(line, ']')) |end_bracket| {
+                    if (strings.eqlComptime(line[0 .. end_bracket + 1], "[core]")) {
+                        @"[core]" = true;
+                        continue;
+                    }
+                }
+                @"[core]" = false;
+                continue;
+            }
+
+            if (@"[core]") {
+                if (!found_askpass) {
+                    if (line.len > "askpass".len and strings.eqlCaseInsensitiveASCIIIgnoreLength(line[0.."askpass".len], "askpass") and switch (line["askpass".len]) {
+                        ' ', '\t', '=' => true,
+                        else => false,
+                    }) {
+                        found_askpass = true;
+                        continue;
+                    }
+                }
+
+                if (!found_ssh_command) {
+                    if (line.len > "sshCommand".len and strings.eqlCaseInsensitiveASCIIIgnoreLength(line[0.."sshCommand".len], "sshCommand") and switch (line["sshCommand".len]) {
+                        ' ', '\t', '=' => true,
+                        else => false,
+                    }) {
+                        found_ssh_command = true;
+                    }
+                }
+            } else {
+                if (!found_askpass) {
+                    if (line.len > "core.askpass".len and strings.eqlCaseInsensitiveASCIIIgnoreLength(line[0.."core.askpass".len], "core.askpass") and switch (line["sshCommand".len]) {
+                        ' ', '\t', '=' => true,
+                        else => false,
+                    }) {
+                        found_askpass = true;
+                        continue;
+                    }
+                }
+
+                if (!found_ssh_command) {
+                    if (line.len > "core.sshCommand".len and strings.eqlCaseInsensitiveASCIIIgnoreLength(line[0.."core.sshCommand".len], "core.sshCommand") and switch (line["sshCommand".len]) {
+                        ' ', '\t', '=' => true,
+                        else => false,
+                    }) {
+                        found_ssh_command = true;
+                    }
+                }
+            }
+        }
+
+        holder = .{
+            .has_askpass = found_askpass,
+            .has_ssh_command = found_ssh_command,
+        };
+    }
+};
 
 pub const Repository = extern struct {
     owner: String = .{},
@@ -28,6 +142,38 @@ pub const Repository = extern struct {
     committish: GitSHA = .{},
     resolved: GitSHA = .{},
     package_name: String = .{},
+
+    pub var shared_env: struct {
+        env: ?DotEnv.Map = null,
+        pub fn get(this: *@This(), allocator: std.mem.Allocator, other: *DotEnv.Loader) DotEnv.Map {
+            return this.env orelse brk: {
+                // Note: currently if the user sets this to some value that causes
+                // a prompt for a password, the stdout of the prompt will be masked
+                // by further output of the rest of the install process.
+                // A value can still be entered, but we need to find a workaround
+                // so the user can see what is being prompted. By default the settings
+                // below will cause no prompt and throw instead.
+                var cloned = other.map.cloneWithAllocator(allocator) catch bun.outOfMemory();
+
+                if (cloned.get("GIT_ASKPASS") == null) {
+                    const config = SloppyGlobalGitConfig.get();
+                    if (!config.has_askpass) {
+                        cloned.put("GIT_ASKPASS", "echo") catch bun.outOfMemory();
+                    }
+                }
+
+                if (cloned.get("GIT_SSH_COMMAND") == null) {
+                    const config = SloppyGlobalGitConfig.get();
+                    if (!config.has_ssh_command) {
+                        cloned.put("GIT_SSH_COMMAND", "ssh -oStrictHostKeyChecking=accept-new") catch bun.outOfMemory();
+                    }
+                }
+
+                this.env = cloned;
+                break :brk this.env.?;
+            };
+        }
+    } = .{};
 
     pub const Hosts = bun.ComptimeStringMap(string, .{
         .{ "bitbucket", ".org" },
@@ -43,11 +189,27 @@ pub const Repository = extern struct {
     ) []u8 {
         const buf = lockfile.buffers.string_bytes.items;
         const dep = lockfile.buffers.dependencies.items[dep_id];
-        const version_literal = dep.version.literal.slice(buf);
         const repo_name = repository.repo;
         const repo_name_str = lockfile.str(&repo_name);
 
-        if (repo_name_str.len == 0) {
+        const name = brk: {
+            var remain = repo_name_str;
+
+            if (strings.indexOfChar(remain, '#')) |hash_index| {
+                remain = remain[0..hash_index];
+            }
+
+            if (remain.len == 0) break :brk remain;
+
+            if (strings.lastIndexOfChar(remain, '/')) |slash_index| {
+                remain = remain[slash_index + 1 ..];
+            }
+
+            break :brk remain;
+        };
+
+        if (name.len == 0) {
+            const version_literal = dep.version.literal.slice(buf);
             const name_buf = allocator.alloc(u8, bun.sha.EVP.SHA1.digest) catch bun.outOfMemory();
             var sha1 = bun.sha.SHA1.init();
             defer sha1.deinit();
@@ -56,26 +218,7 @@ pub const Repository = extern struct {
             return name_buf[0..bun.sha.SHA1.digest];
         }
 
-        var len: usize = 0;
-        var remain = repo_name_str;
-        while (strings.indexOfChar(remain, '@')) |at_index| {
-            len += remain[0..at_index].len;
-            remain = remain[at_index + 1 ..];
-        }
-        len += remain.len;
-
-        const name_buf = allocator.alloc(u8, len) catch bun.outOfMemory();
-        var name = name_buf;
-        len = 0;
-        remain = repo_name_str;
-        while (strings.indexOfChar(remain, '@')) |at_index| {
-            @memcpy(name[0..at_index], remain[0..at_index]);
-            name = name[at_index + 1 ..];
-            remain = remain[at_index + 1 ..];
-        }
-
-        @memcpy(name[0..remain.len], remain);
-        return name_buf[0..name_buf.len];
+        return allocator.dupe(u8, name) catch bun.outOfMemory();
     }
 
     pub fn order(lhs: *const Repository, rhs: *const Repository, lhs_buf: []const u8, rhs_buf: []const u8) std.math.Order {
@@ -150,40 +293,13 @@ pub const Repository = extern struct {
 
     fn exec(
         allocator: std.mem.Allocator,
-        env: *DotEnv.Loader,
+        _env: DotEnv.Map,
         argv: []const string,
     ) !string {
-        // Note: currently if the user sets this to some value that causes
-        // a prompt for a password, the stdout of the prompt will be masked
-        // by further output of the rest of the install process.
-        // A value can still be entered, but we need to find a workaround
-        // so the user can see what is being prompted. By default the settings
-        // below will cause no prompt and throw instead.
-        const askpass_entry = env.map.getOrPutWithoutValue("GIT_ASKPASS") catch bun.outOfMemory();
-        if (!askpass_entry.found_existing) {
-            askpass_entry.key_ptr.* = allocator.dupe(u8, "GIT_ASKPASS") catch bun.outOfMemory();
-            askpass_entry.value_ptr.* = .{
-                .value = allocator.dupe(u8, "echo") catch bun.outOfMemory(),
-                .conditional = false,
-            };
-        }
+        var env = _env;
+        var std_map = try env.stdEnvMap(allocator);
 
-        const ssh_command_entry = env.map.getOrPutWithoutValue("GIT_SSH_COMMAND") catch bun.outOfMemory();
-        if (!ssh_command_entry.found_existing) {
-            ssh_command_entry.key_ptr.* = allocator.dupe(u8, "GIT_SSH_COMMAND") catch bun.outOfMemory();
-            ssh_command_entry.value_ptr.* = .{
-                .value = allocator.dupe(u8, "ssh -oStrictHostKeyChecking=accept-new") catch bun.outOfMemory(),
-                .conditional = false,
-            };
-        }
-
-        var std_map = try env.map.stdEnvMap(allocator);
-
-        defer {
-            if (!askpass_entry.found_existing) env.map.remove("GIT_ASKPASS");
-            if (!ssh_command_entry.found_existing) env.map.remove("GIT_SSH_COMMAND");
-            std_map.deinit();
-        }
+        defer std_map.deinit();
 
         const result = if (comptime Environment.isWindows)
             try std.process.Child.run(.{
@@ -203,7 +319,11 @@ pub const Repository = extern struct {
             // remote: The page could not be found <-- for non git
             // remote: Repository not found. <-- for git
             // remote: fatal repository '<url>' does not exist <-- for git
-            (strings.containsComptime(result.stderr, "remote:") and strings.containsComptime(result.stderr, "not") and strings.containsComptime(result.stderr, "found")) or strings.containsComptime(result.stderr, "does not exist")) {
+            (strings.containsComptime(result.stderr, "remote:") and
+                strings.containsComptime(result.stderr, "not") and
+                strings.containsComptime(result.stderr, "found")) or
+                strings.containsComptime(result.stderr, "does not exist"))
+            {
                 return error.RepositoryNotFound;
             },
             else => {},
@@ -287,7 +407,16 @@ pub const Repository = extern struct {
         return null;
     }
 
-    pub fn download(allocator: std.mem.Allocator, env: *DotEnv.Loader, log: *logger.Log, cache_dir: std.fs.Dir, task_id: u64, name: string, url: string, attempt: u8) !std.fs.Dir {
+    pub fn download(
+        allocator: std.mem.Allocator,
+        env: DotEnv.Map,
+        log: *logger.Log,
+        cache_dir: std.fs.Dir,
+        task_id: u64,
+        name: string,
+        url: string,
+        attempt: u8,
+    ) !std.fs.Dir {
         bun.Analytics.Features.git_dependencies += 1;
         const folder_name = try std.fmt.bufPrintZ(&folder_name_buf, "{any}.git", .{
             bun.fmt.hexIntLower(task_id),
@@ -358,7 +487,7 @@ pub const Repository = extern struct {
 
         return std.mem.trim(u8, exec(
             allocator,
-            env,
+            shared_env.get(allocator, env),
             if (committish.len > 0)
                 &[_]string{ "git", "-C", path, "log", "--format=%H", "-1", committish }
             else
@@ -377,7 +506,7 @@ pub const Repository = extern struct {
 
     pub fn checkout(
         allocator: std.mem.Allocator,
-        env: *DotEnv.Loader,
+        env: DotEnv.Map,
         log: *logger.Log,
         cache_dir: std.fs.Dir,
         repo_dir: std.fs.Dir,

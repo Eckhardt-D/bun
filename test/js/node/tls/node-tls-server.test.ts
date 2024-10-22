@@ -1,11 +1,12 @@
-import tls, { rootCertificates, connect, createServer, Server, TLSSocket } from "tls";
-import type { PeerCertificate } from "tls";
-import { realpathSync, readFileSync } from "fs";
+import { readFileSync, realpathSync } from "fs";
+import { tls as cert1 } from "harness";
+import { AddressInfo } from "net";
+import { createTest } from "node-harness";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createTest } from "node-harness";
-import { AddressInfo } from "net";
-import { tls as cert1, expiredTls as cert2 } from "harness";
+import type { PeerCertificate } from "tls";
+import tls, { connect, createServer, rootCertificates, Server, TLSSocket } from "tls";
+import { once } from "node:events";
 
 const { describe, expect, it, createCallCheckCtx } = createTest(import.meta.path);
 
@@ -464,15 +465,12 @@ describe("tls.createServer events", () => {
     );
   });
 
-  it("should call close", done => {
-    let closed = false;
+  it("should call close", async () => {
+    const { promise, reject, resolve } = Promise.withResolvers();
     const server: Server = createServer(COMMON_CERT);
-    server.listen().on("close", () => {
-      closed = true;
-    });
+    server.listen().on("close", resolve).on("error", reject);
     server.close();
-    expect(closed).toBe(true);
-    done();
+    await promise;
   });
 
   it("should call connection and drop", done => {
@@ -628,6 +626,9 @@ describe("tls.createServer events", () => {
           hostname: address.address,
           port: address.port,
           socket: {
+            error(socket, err) {
+              closeAndFail();
+            },
             drain(socket) {
               socket.write("Hello");
             },
@@ -661,4 +662,44 @@ it("tls.rootCertificates should exists", () => {
   expect(rootCertificates).toBeInstanceOf(Array);
   expect(rootCertificates.length).toBeGreaterThan(0);
   expect(typeof rootCertificates[0]).toBe("string");
+});
+
+it("connectionListener should emit the right amount of times, and with alpnProtocol available", async () => {
+  let count = 0;
+  const promises = [];
+  const server: Server = createServer(
+    {
+      ...COMMON_CERT,
+      ALPNProtocols: ["bun"],
+    },
+    socket => {
+      count++;
+      expect(socket.alpnProtocol).toBe("bun");
+      socket.end();
+    },
+  );
+  server.setMaxListeners(100);
+
+  server.listen(0);
+  await once(server, "listening");
+  for (let i = 0; i < 50; i++) {
+    const { promise, resolve } = Promise.withResolvers();
+    promises.push(promise);
+    const socket = connect(
+      {
+        ca: COMMON_CERT.cert,
+        rejectUnauthorized: false,
+        port: server.address().port,
+        ALPNProtocols: ["bun"],
+      },
+      () => {
+        socket.on("close", resolve);
+        socket.resume();
+        socket.end();
+      },
+    );
+  }
+
+  await Promise.all(promises);
+  expect(count).toBe(50);
 });
